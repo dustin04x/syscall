@@ -1,0 +1,12 @@
+/target
+**/*.rs.bk
+ebpf/*.o
+ebpf/vmlinux.h
+*.db
+*.db-wal
+*.db-shm
+.DS_Store
+
+# Local debug/e2e artifacts
+/e2e-debug.log
+/*.log

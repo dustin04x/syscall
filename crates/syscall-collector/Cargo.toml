@@ -1,0 +1,24 @@
+[package]
+name = "syscall-collector"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "libbpf-based eBPF collector for SYSCALL"
+
+[dependencies]
+libbpf-rs.workspace = true
+libc.workspace = true
+syscall-core = { path = "../syscall-core" }
+syscall-storage = { path = "../syscall-storage" }
+thiserror.workspace = true
+tracing.workspace = true
+
+[build-dependencies]
+libbpf-cargo.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
