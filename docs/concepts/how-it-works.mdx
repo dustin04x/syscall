@@ -7,26 +7,25 @@ SYSCALL separates collection, decoding, attribution, storage, and investigation.
 
 ## Collection path
 
-```text
-sched and syscall tracepoints
-            │
-            ▼
-   fixed-size wire samples
-            │
-            ▼
-    4 MiB BPF ring buffer
-            │
-            ▼
- strict decoder in userspace
-            │
-            ▼
- scope and identity attribution
-            │
-            ▼
- bounded channel ──► writer thread ──► SQLite
-```
+<Steps>
+  <Step title="Kernel tracepoints">
+    Seven stable `sched` and `syscalls` tracepoints observe process lifecycle and syscall activity and emit fixed-size wire samples.
+  </Step>
+  <Step title="BPF ring buffer">
+    Samples are written to a 4&nbsp;MiB BPF ring buffer. The kernel drops samples when the buffer is full; loss is counted, not hidden.
+  </Step>
+  <Step title="Strict userspace decode">
+    A userspace callback reads each sample, validates its header and payload, and discards malformed input without terminating the session.
+  </Step>
+  <Step title="Scope and identity attribution">
+    Decoded events are attributed to canonical process instances and admitted or filtered according to the recording scope.
+  </Step>
+  <Step title="Buffered persistence">
+    Attributed events pass through a bounded channel to a dedicated writer thread, which batches writes and commits them to SQLite.
+  </Step>
+</Steps>
 
-The ring-buffer callback does no disk I/O. It decodes a sample, attributes it, and sends it to a bounded userspace channel. A dedicated writer owns its own SQLite connection and commits batches.
+The ring-buffer callback performs no disk I/O: it decodes, attributes, and enqueues. The writer owns its own SQLite connection and commits batches transactionally.
 
 ## Tracepoints
 
