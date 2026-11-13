@@ -59,6 +59,19 @@ cd desktop && npm install && npm run tauri:build -- --no-bundle
 
 See the [installation guide](https://syscall.mintlify.site/installation) and [workbench guide](https://syscall.mintlify.site/guides/workbench) for prerequisites and details.
 
+### Docker
+
+Launch the web UI preview and a `syscall` CLI container with one command (Docker Desktop / Docker Compose):
+
+```bash
+docker compose up --build -d
+```
+
+- **UI preview:** [http://localhost:8080](http://localhost:8080) (serves the standalone mock workbench in `ui/`).
+- **CLI container:** `docker compose exec syscall syscall --help` (the project is mounted at `/work`, so you can inspect/verify/analyze/export mounted SQLite session databases).
+
+> Live eBPF recording requires Linux kernel BPF/BTF support and elevated privileges on the host kernel; running `record` inside Docker Desktop's Linux VM is environment-dependent and may not work the same as a native Linux host. Use the CLI on a supported host for capture, then inspect the resulting database here.
+
 ## Documentation
 
 Full documentation is hosted at **[syscall.mintlify.site](https://syscall.mintlify.site/)**, covering:

@@ -1,0 +1,21 @@
+services:
+  ui:
+    build:
+      context: .
+      dockerfile: docker/ui.Dockerfile
+    ports:
+      - "8080:80"
+    restart: unless-stopped
+
+  syscall:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    working_dir: /work
+    volumes:
+      - ./:/work
+    # Keeps the container running so you can exec CLI commands, e.g.:
+    #   docker compose exec syscall syscall sessions list --db /work/sessions.db
+    entrypoint: ["/bin/sh", "-lc"]
+    command: ["sleep infinity"]
+    restart: unless-stopped
