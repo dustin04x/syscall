@@ -4,12 +4,14 @@
 //! field is bounds-checked; malformed samples are counted by the collector and
 //! discarded without terminating the session.
 
-use syscall_core::{EventType, COMM_LEN, MAX_FILENAME_LEN};
+use std::net::{Ipv4Addr, Ipv6Addr};
+
+use syscall_core::{AddressFamily, EventType, COMM_LEN, MAX_FILENAME_LEN};
 use thiserror::Error;
 use tracing;
 
 pub const EVENT_MAGIC: u32 = 0x5343_594c;
-pub const WIRE_SCHEMA_VERSION: u16 = 2;
+pub const WIRE_SCHEMA_VERSION: u16 = 3;
 
 pub const HEADER_LEN: usize = 56;
 const PID_OFFSET: usize = 16;
@@ -33,6 +35,24 @@ const FORK_MIN_LEN: usize = FORK_CHILD_COMM_OFFSET + COMM_LEN;
 const EXIT_PRIORITY_OFFSET: usize = 56;
 const EXIT_MIN_LEN: usize = EXIT_PRIORITY_OFFSET + 4;
 
+const FILE_RESULT_OFFSET: usize = 56;
+const FILE_DIRFD_OFFSET: usize = 64;
+const FILE_FLAGS_OFFSET: usize = 68;
+const FILE_ABSOLUTE_OFFSET: usize = 72;
+const FILE_TRUNCATED_OFFSET: usize = 73;
+const FILE_PATH_OFFSET: usize = 80;
+const FILE_MIN_LEN: usize = FILE_PATH_OFFSET;
+
+const NET_RESULT_OFFSET: usize = 56;
+const NET_FAMILY_OFFSET: usize = 64;
+const NET_DEST_PORT_OFFSET: usize = 66;
+const NET_SOURCE_PORT_OFFSET: usize = 68;
+const NET_ADDRESS_LEN_OFFSET: usize = 70;
+const NET_SOURCE_AVAILABLE_OFFSET: usize = 71;
+const NET_DEST_ADDRESS_OFFSET: usize = 72;
+const NET_SOURCE_ADDRESS_OFFSET: usize = 88;
+const NET_MIN_LEN: usize = 104;
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum DecodeError {
     #[error("event is too short: {actual} bytes, need at least {minimum} for {kind}")]
@@ -50,6 +70,13 @@ pub enum DecodeError {
 
     #[error("unsupported wire event type {0}")]
     UnsupportedEventType(u16),
+
+    #[error("{event_type} requires wire schema >= {minimum}, got {found}")]
+    SchemaTooOldForEvent {
+        event_type: &'static str,
+        minimum: u16,
+        found: u16,
+    },
 
     #[error("invalid {field} value: {value}")]
     InvalidField { field: &'static str, value: i64 },
@@ -79,6 +106,22 @@ pub enum DecodedPayload {
     Exit {
         exit_priority: i32,
     },
+    FileOpen {
+        path: String,
+        path_is_absolute: bool,
+        path_truncated: bool,
+        dirfd: i32,
+        flags: u32,
+        result: i64,
+    },
+    NetworkConnect {
+        family: AddressFamily,
+        source_address: Option<String>,
+        source_port: Option<u16>,
+        destination_address: String,
+        destination_port: u16,
+        result: i64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,6 +137,8 @@ pub struct DecodedEvent {
     pub gid: u32,
     pub comm: String,
     pub payload: DecodedPayload,
+    /// Wire schema version of the decoded sample (1..=3).
+    pub wire_schema_version: u16,
 }
 
 /// Decode one ring-buffer sample. All reads are bounds-checked.
@@ -111,11 +156,18 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedEvent, DecodeError> {
         return Err(DecodeError::BadMagic(magic));
     }
     let schema_version = u16_at(bytes, 4);
-    if schema_version != 1 && schema_version != WIRE_SCHEMA_VERSION {
+    if schema_version == 0 || schema_version > WIRE_SCHEMA_VERSION {
         return Err(DecodeError::UnsupportedSchemaVersion(schema_version));
     }
     let event_type = EventType::from_wire_id(u16_at(bytes, 6))
         .ok_or_else(|| DecodeError::UnsupportedEventType(u16_at(bytes, 6)))?;
+    if schema_version < event_type.minimum_wire_schema() {
+        return Err(DecodeError::SchemaTooOldForEvent {
+            event_type: event_type.as_str(),
+            minimum: event_type.minimum_wire_schema(),
+            found: schema_version,
+        });
+    }
 
     let monotonic_ns = u64_at(bytes, 8);
     if monotonic_ns == 0 {
@@ -212,8 +264,110 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedEvent, DecodeError> {
                 exit_priority: i32_at(bytes, EXIT_PRIORITY_OFFSET),
             }
         }
-        EventType::FileOpen | EventType::NetworkConnect => {
-            return Err(DecodeError::UnsupportedEventType(event_type.wire_id()));
+        EventType::FileOpen => {
+            if bytes.len() < FILE_MIN_LEN {
+                return Err(DecodeError::TooShort {
+                    kind: "file_open",
+                    actual: bytes.len(),
+                    minimum: FILE_MIN_LEN,
+                });
+            }
+            if data_len > MAX_FILENAME_LEN {
+                return Err(DecodeError::PayloadTooLong {
+                    length: data_len,
+                    limit: MAX_FILENAME_LEN,
+                });
+            }
+            let end = FILE_PATH_OFFSET
+                .checked_add(data_len)
+                .ok_or(DecodeError::PayloadPastEnd)?;
+            if end > bytes.len() {
+                return Err(DecodeError::PayloadPastEnd);
+            }
+            if data_len > 0 {
+                let nul = *bytes.get(end).ok_or(DecodeError::PayloadPastEnd)?;
+                if nul != 0 {
+                    return Err(DecodeError::MissingNul { field: "path" });
+                }
+            }
+            let path = String::from_utf8_lossy(&bytes[FILE_PATH_OFFSET..end]).into_owned();
+            let absolute = bytes[FILE_ABSOLUTE_OFFSET];
+            let truncated = bytes[FILE_TRUNCATED_OFFSET];
+            if absolute > 1 || truncated > 1 {
+                return Err(DecodeError::InvalidField {
+                    field: "path flags",
+                    value: i64::from(absolute) << 8 | i64::from(truncated),
+                });
+            }
+            DecodedPayload::FileOpen {
+                path,
+                path_is_absolute: absolute == 1,
+                path_truncated: truncated == 1,
+                dirfd: i32_at(bytes, FILE_DIRFD_OFFSET),
+                flags: u32_at(bytes, FILE_FLAGS_OFFSET),
+                result: i64_at(bytes, FILE_RESULT_OFFSET),
+            }
+        }
+        EventType::NetworkConnect => {
+            if bytes.len() < NET_MIN_LEN {
+                return Err(DecodeError::TooShort {
+                    kind: "network_connect",
+                    actual: bytes.len(),
+                    minimum: NET_MIN_LEN,
+                });
+            }
+            let family = match u16_at(bytes, NET_FAMILY_OFFSET) {
+                2 => AddressFamily::Ipv4,
+                10 => AddressFamily::Ipv6,
+                other => {
+                    return Err(DecodeError::InvalidField {
+                        field: "address family",
+                        value: i64::from(other),
+                    })
+                }
+            };
+            let address_len = bytes[NET_ADDRESS_LEN_OFFSET];
+            let expected_len = match family {
+                AddressFamily::Ipv4 => 4,
+                AddressFamily::Ipv6 => 16,
+            };
+            if address_len != expected_len {
+                return Err(DecodeError::InvalidField {
+                    field: "address length",
+                    value: i64::from(address_len),
+                });
+            }
+            let destination = decode_address(
+                family,
+                &bytes[NET_DEST_ADDRESS_OFFSET..NET_DEST_ADDRESS_OFFSET + expected_len as usize],
+            );
+            let source_available = bytes[NET_SOURCE_AVAILABLE_OFFSET];
+            if source_available > 1 {
+                return Err(DecodeError::InvalidField {
+                    field: "source_available",
+                    value: i64::from(source_available),
+                });
+            }
+            let (source_address, source_port) = if source_available == 1 {
+                (
+                    Some(decode_address(
+                        family,
+                        &bytes[NET_SOURCE_ADDRESS_OFFSET
+                            ..NET_SOURCE_ADDRESS_OFFSET + expected_len as usize],
+                    )),
+                    Some(u16::from_be(u16_at(bytes, NET_SOURCE_PORT_OFFSET))),
+                )
+            } else {
+                (None, None)
+            };
+            DecodedPayload::NetworkConnect {
+                family,
+                source_address,
+                source_port,
+                destination_address: destination,
+                destination_port: u16::from_be(u16_at(bytes, NET_DEST_PORT_OFFSET)),
+                result: i64_at(bytes, NET_RESULT_OFFSET),
+            }
         }
     };
 
@@ -238,7 +392,23 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedEvent, DecodeError> {
         gid,
         comm,
         payload,
+        wire_schema_version: schema_version,
     })
+}
+
+fn decode_address(family: AddressFamily, bytes: &[u8]) -> String {
+    match family {
+        AddressFamily::Ipv4 => {
+            let mut octets = [0u8; 4];
+            octets.copy_from_slice(&bytes[..4]);
+            Ipv4Addr::from(octets).to_string()
+        }
+        AddressFamily::Ipv6 => {
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&bytes[..16]);
+            Ipv6Addr::from(octets).to_string()
+        }
+    }
 }
 
 fn decode_comm(bytes: &[u8], field: &'static str) -> Result<String, DecodeError> {
@@ -277,6 +447,13 @@ fn u64_at(bytes: &[u8], offset: usize) -> u64 {
     u64::from_ne_bytes(array)
 }
 
+fn i64_at(bytes: &[u8], offset: usize) -> i64 {
+    let array: [u8; 8] = bytes[offset..offset + 8]
+        .try_into()
+        .expect("bounds checked by caller");
+    i64::from_ne_bytes(array)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,6 +468,9 @@ mod tests {
         bytes[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
     }
     fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
+        bytes[offset..offset + 8].copy_from_slice(&value.to_ne_bytes());
+    }
+    fn put_i64(bytes: &mut [u8], offset: usize, value: i64) {
         bytes[offset..offset + 8].copy_from_slice(&value.to_ne_bytes());
     }
     fn put_comm(bytes: &mut [u8], offset: usize, value: &str) {
@@ -309,6 +489,11 @@ mod tests {
         put_u32(bytes, UID_OFFSET, 1000);
         put_u32(bytes, GID_OFFSET, 1000);
         put_comm(bytes, COMM_OFFSET, "sleep");
+    }
+
+    fn header_v2(bytes: &mut [u8], event_type: u16) {
+        header(bytes, event_type);
+        put_u16(bytes, 4, 2);
     }
 
     #[test]
@@ -359,6 +544,159 @@ mod tests {
         put_i32(&mut bytes, EXIT_PRIORITY_OFFSET, 120);
         let event = decode(&bytes).unwrap();
         assert_eq!(event.payload, DecodedPayload::Exit { exit_priority: 120 });
+    }
+
+    #[test]
+    fn decodes_successful_file_open() {
+        let mut bytes = vec![0u8; 336];
+        header(&mut bytes, 4);
+        put_i64(&mut bytes, FILE_RESULT_OFFSET, 7);
+        put_i32(&mut bytes, FILE_DIRFD_OFFSET, -100);
+        put_u32(&mut bytes, FILE_FLAGS_OFFSET, 0x8000);
+        bytes[FILE_ABSOLUTE_OFFSET] = 1;
+        let path = b"/etc/passwd";
+        bytes[FILE_PATH_OFFSET..FILE_PATH_OFFSET + path.len()].copy_from_slice(path);
+        put_u32(&mut bytes, DATA_LEN_OFFSET, path.len() as u32);
+
+        let event = decode(&bytes).unwrap();
+        assert_eq!(event.event_type, EventType::FileOpen);
+        assert_eq!(event.wire_schema_version, 3);
+        assert_eq!(
+            event.payload,
+            DecodedPayload::FileOpen {
+                path: "/etc/passwd".to_owned(),
+                path_is_absolute: true,
+                path_truncated: false,
+                dirfd: -100,
+                flags: 0x8000,
+                result: 7,
+            }
+        );
+    }
+
+    #[test]
+    fn decodes_failed_and_truncated_file_open() {
+        let mut bytes = vec![0u8; 336];
+        header(&mut bytes, 4);
+        put_i64(&mut bytes, FILE_RESULT_OFFSET, -13);
+        put_i32(&mut bytes, FILE_DIRFD_OFFSET, 3);
+        bytes[FILE_TRUNCATED_OFFSET] = 1;
+        let path = vec![b'a'; MAX_FILENAME_LEN - 1];
+        bytes[FILE_PATH_OFFSET..FILE_PATH_OFFSET + path.len()].copy_from_slice(&path);
+        put_u32(&mut bytes, DATA_LEN_OFFSET, path.len() as u32);
+
+        let event = decode(&bytes).unwrap();
+        match event.payload {
+            DecodedPayload::FileOpen {
+                path,
+                path_is_absolute,
+                path_truncated,
+                result,
+                ..
+            } => {
+                assert_eq!(path.len(), MAX_FILENAME_LEN - 1);
+                assert!(!path_is_absolute);
+                assert!(path_truncated);
+                assert_eq!(result, -13);
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decodes_ipv4_connect() {
+        let mut bytes = vec![0u8; NET_MIN_LEN];
+        header(&mut bytes, 5);
+        put_i64(&mut bytes, NET_RESULT_OFFSET, 0);
+        put_u16(&mut bytes, NET_FAMILY_OFFSET, 2);
+        put_u16(&mut bytes, NET_DEST_PORT_OFFSET, 443u16.to_be());
+        bytes[NET_ADDRESS_LEN_OFFSET] = 4;
+        bytes[NET_DEST_ADDRESS_OFFSET..NET_DEST_ADDRESS_OFFSET + 4]
+            .copy_from_slice(&[93, 184, 216, 34]);
+
+        let event = decode(&bytes).unwrap();
+        assert_eq!(
+            event.payload,
+            DecodedPayload::NetworkConnect {
+                family: AddressFamily::Ipv4,
+                source_address: None,
+                source_port: None,
+                destination_address: "93.184.216.34".to_owned(),
+                destination_port: 443,
+                result: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn decodes_ipv6_connect_with_source() {
+        let mut bytes = vec![0u8; NET_MIN_LEN];
+        header(&mut bytes, 5);
+        put_i64(&mut bytes, NET_RESULT_OFFSET, -111);
+        put_u16(&mut bytes, NET_FAMILY_OFFSET, 10);
+        put_u16(&mut bytes, NET_DEST_PORT_OFFSET, 8443u16.to_be());
+        put_u16(&mut bytes, NET_SOURCE_PORT_OFFSET, 51515u16.to_be());
+        bytes[NET_ADDRESS_LEN_OFFSET] = 16;
+        bytes[NET_SOURCE_AVAILABLE_OFFSET] = 1;
+        let dest: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let src: Ipv6Addr = "2001:db8::2".parse().unwrap();
+        bytes[NET_DEST_ADDRESS_OFFSET..NET_DEST_ADDRESS_OFFSET + 16]
+            .copy_from_slice(&dest.octets());
+        bytes[NET_SOURCE_ADDRESS_OFFSET..NET_SOURCE_ADDRESS_OFFSET + 16]
+            .copy_from_slice(&src.octets());
+
+        let event = decode(&bytes).unwrap();
+        assert_eq!(
+            event.payload,
+            DecodedPayload::NetworkConnect {
+                family: AddressFamily::Ipv6,
+                source_address: Some("2001:db8::2".to_owned()),
+                source_port: Some(51515),
+                destination_address: "2001:db8::1".to_owned(),
+                destination_port: 8443,
+                result: -111,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_file_event_in_old_wire_schema() {
+        let mut bytes = vec![0u8; 336];
+        header_v2(&mut bytes, 4);
+        assert!(matches!(
+            decode(&bytes),
+            Err(DecodeError::SchemaTooOldForEvent { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_address_family() {
+        let mut bytes = vec![0u8; NET_MIN_LEN];
+        header(&mut bytes, 5);
+        put_u16(&mut bytes, NET_FAMILY_OFFSET, 1);
+        bytes[NET_ADDRESS_LEN_OFFSET] = 16;
+        assert!(matches!(
+            decode(&bytes),
+            Err(DecodeError::InvalidField {
+                field: "address family",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_inconsistent_address_length() {
+        let mut bytes = vec![0u8; NET_MIN_LEN];
+        header(&mut bytes, 5);
+        put_u16(&mut bytes, NET_FAMILY_OFFSET, 2);
+        bytes[NET_ADDRESS_LEN_OFFSET] = 16;
+        assert!(matches!(
+            decode(&bytes),
+            Err(DecodeError::InvalidField {
+                field: "address length",
+                ..
+            })
+        ));
     }
 
     #[test]

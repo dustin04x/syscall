@@ -26,6 +26,20 @@ pub enum StorageError {
 
     #[error("invalid database path: {0}")]
     InvalidPath(String),
+
+    #[error("invalid session state transition for {session_id}: {from} -> {to}")]
+    InvalidTransition {
+        session_id: String,
+        from: String,
+        to: String,
+    },
+
+    #[error("session {session_id} is already finalized as {existing}; refusing conflicting finalization as {attempted}")]
+    ConflictingFinalization {
+        session_id: String,
+        existing: String,
+        attempted: String,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, StorageError>;

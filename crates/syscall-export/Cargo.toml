@@ -1,0 +1,19 @@
+[package]
+name = "syscall-export"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Deterministic, verifiable JSON evidence export for SYSCALL sessions"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+syscall-analysis = { path = "../syscall-analysis" }
+syscall-core = { path = "../syscall-core" }
+syscall-storage = { path = "../syscall-storage" }
+
+[lints]
+workspace = true

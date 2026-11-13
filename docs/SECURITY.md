@@ -40,12 +40,17 @@ The collector does not attempt to regain privilege after the drop.
 
 ## Data handling
 
-Collected data is limited to process lifecycle metadata:
+Collected data now includes process lifecycle, file-open, and IP connect
+metadata:
 
 - Command name (`comm`), executable filename for exec, PID/TID/PPID, UID/GID.
+- Raw `openat(2)` path strings, flags, dirfd, and raw result. Paths may reveal
+  sensitive filenames or directory structure.
+- Connect address family, destination/source IP and port, and raw result. This
+  metadata reveals destinations but not payloads.
 - Timestamps and a stable process-instance identity.
-- No file contents, environment variables, memory, network payloads, or
-  command-line arguments are read from the kernel.
+- No file contents, environment variables, memory, packet payloads, DNS names,
+  or command-line arguments are read from the kernel.
 
 Target arguments are stored in the session row by default because they are
 forensically useful. They can contain secrets. Use:
@@ -80,7 +85,11 @@ affect their own process, because writes happen after the privilege drop.
 - eBPF uses a 4 MiB ring buffer and fixed-size stack events.
 - The userspace channel is bounded at 8192 events.
 - The writer batches at most 256 events per transaction.
-- Filename capture is bounded at 256 bytes; comm is 16 bytes.
+- Filename/path capture is bounded at 256 bytes; comm is 16 bytes.
+- Syscall pairing maps are bounded LRU hashes of 8192 entries each; eviction or a
+  missing enter means the attempt is not reported, never invented.
+- Activity events are fixed-size wire structs; file-open events are
+  ring-buffer-reserved to avoid exceeding the BPF stack.
 - Malformed samples are discarded and counted; they cannot panic the decoder.
 - Out-of-scope and dropped events are counted separately, so a busy host does
   not silently look complete.
@@ -140,7 +149,31 @@ standard string escaping. Timestamps are always rendered as UTC.
   before `/proc/<pid>/status` can be read.
 - The wall-clock offset is captured once; clock changes can skew derived wall
   timestamps, though monotonic timestamps remain ordered.
+- File paths are recorded exactly as passed to `openat`, not resolved. Relative
+  paths and `dirfd` bases require investigator interpretation; a path alone does
+  not prove which file was ultimately accessed.
+- A file-open event proves the syscall attempt and return value, not that file
+  contents were read or written.
+- Connect events prove `connect(2)` attempts, not established connections,
+  payload transfer, or application protocol. The syscall tracepoint cannot
+  distinguish TCP from UDP, and source addresses are usually unavailable.
+- Missing syscall enter/exit samples or pairing-map evictions are not separately
+  counted; absent activity is not proof of no activity.
 - There is no integrity signature or tamper-evident log. An attacker with write
   access to the database can modify it.
 - No audit log records who ran the privileged recorder; use your OS audit
   tooling for that.
+
+
+## Investigation and evidence export (Phase 4)
+
+Investigation commands (`processes`, `tree`, `timeline`, `stats`, `export`) operate on persisted evidence only:
+
+- **Read-only access:** session inspection/verification/export open databases read-only (`query_only`) and do not run migrations or modify recording data. Export never modifies the original recording database.
+- **No execution:** recorded commands/event payloads are treated as untrusted data and are never executed.
+- **Redaction preserved:** session arguments are reported/exported as recorded. If `--redact-args` was used, original argument values are not present and are not revealed by investigation/export.
+- **No secrets/unrelated data:** environment variables are never exported. Only the requested session is exported; unrelated sessions are excluded.
+- **Output safety:** human-readable terminal output escapes control characters in untrusted fields to prevent escape-sequence injection. JSON output remains valid for unusual characters.
+- **Export file handling:** JSON export is written atomically (temporary file in the destination directory, fsync, rename) with restrictive permissions (`0600` on Unix). An existing output file is never overwritten without an explicit `--force` flag. The destination directory must already exist.
+- **Integrity manifest:** exports include SHA-256 digests over exported evidence components for post-export integrity checking. `syscall verify-export` checks these hashes and byte lengths read-only; it does not prove the original database was authentic or untampered before export and is not a digital signature or chain of custody.
+- **Honest incompleteness:** when kernel/userspace losses occurred, identity/ancestry is unresolved, provenance is unavailable (legacy records), or verification cannot complete, outputs/exports state limitations explicitly rather than implying complete or valid evidence.

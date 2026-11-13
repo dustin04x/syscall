@@ -42,12 +42,16 @@ Compile the standalone object without Rust:
 make -C ebpf clean check
 ```
 
-Expected output includes three tracepoint sections:
+Expected output includes seven tracepoint sections:
 
 ```
 tracepoint/sched/sched_process_exec
 tracepoint/sched/sched_process_fork
 tracepoint/sched/sched_process_exit
+tracepoint/syscalls/sys_enter_openat
+tracepoint/syscalls/sys_exit_openat
+tracepoint/syscalls/sys_enter_connect
+tracepoint/syscalls/sys_exit_connect
 license
 .maps
 ```
@@ -135,8 +139,9 @@ sudo scripts/e2e-root.sh
 `scripts/e2e-root.sh`:
 
 1. Refuses to run unless invoked through sudo for a non-root user.
-2. Verifies `syscall info` reports BPF-capable and that all three tracepoints are
-   visible.
+2. Verifies `syscall info` reports BPF-capable and that all three scheduler
+   lifecycle tracepoints are visible. Phase 5 open/connect capture has a
+   separate manual validation section in `docs/WSL_COMPATIBILITY.md`.
 3. Records a small target tree and inspects it as the invoking user.
 4. Sends SIGINT to a second recording and verifies exit 130 and `interrupted`.
 5. Verifies the database is owned by the user and mode `600`.
@@ -178,3 +183,21 @@ Adding `file_open` or `network_connect` requires all of:
 
 Do not mark a placeholder as collected until the kernel path exists. The domain
 validator intentionally rejects schema-only variants.
+
+
+## Investigation and evidence export (Phase 4)
+
+Read-only investigation commands operate on persisted session databases (no eBPF attach, no privilege required):
+
+```bash
+syscall processes <SESSION_ID>
+syscall tree <SESSION_ID>
+syscall timeline <SESSION_ID> [--type TYPE] [--pid PID] [--process-instance ID] [--from TIME] [--to TIME] [--limit N] [--offset N] [--json]
+syscall stats <SESSION_ID> [--verify] [--json]
+syscall export <SESSION_ID> --format json --output <FILE> [--force]
+```
+
+- `TIME` accepts Unix epoch nanoseconds or RFC3339 timestamps.
+- Export is deterministic for identical recorded evidence (verification report timestamp normalized in export; export action timestamp recorded in metadata), atomic, `0600` on Unix, and refuses overwrite without `--force`.
+- Export embeds a read-only verification outcome (or explicit failure/limitation) and a SHA-256 manifest for post-export integrity checking (not proof of pre-export authenticity).
+- See `docs/INVESTIGATION.md` and `docs/EVIDENCE_EXPORT.md` for workflow, format, hashing semantics, and privacy guarantees.

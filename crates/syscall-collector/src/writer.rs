@@ -20,24 +20,36 @@ pub struct WriterStats {
     pub persisted: u64,
 }
 
+/// Writer completion. The stats remain available when a later batch fails, so
+/// the collector can report what was committed instead of discarding it.
+#[derive(Debug)]
+pub struct WriterOutcome {
+    pub stats: WriterStats,
+    pub error: Option<StorageError>,
+}
+
 pub fn spawn(
     database_path: PathBuf,
     session_id: String,
     receiver: Receiver<Event>,
-) -> JoinHandle<Result<WriterStats, StorageError>> {
+) -> JoinHandle<WriterOutcome> {
     thread::Builder::new()
         .name("syscall-writer".to_owned())
         .spawn(move || run(&database_path, &session_id, receiver))
         .expect("failed to spawn writer thread")
 }
 
-fn run(
-    database_path: &PathBuf,
-    session_id: &str,
-    receiver: Receiver<Event>,
-) -> Result<WriterStats, StorageError> {
-    let mut storage = Storage::open(database_path)?;
+fn run(database_path: &PathBuf, session_id: &str, receiver: Receiver<Event>) -> WriterOutcome {
     let mut stats = WriterStats::default();
+    let mut storage = match Storage::open(database_path) {
+        Ok(storage) => storage,
+        Err(error) => {
+            return WriterOutcome {
+                stats,
+                error: Some(error),
+            }
+        }
+    };
     let mut batch = Vec::with_capacity(BATCH_SIZE);
 
     loop {
@@ -45,24 +57,48 @@ fn run(
             Ok(event) => {
                 batch.push(event);
                 if batch.len() >= BATCH_SIZE {
-                    stats.persisted += flush(&mut storage, session_id, &mut batch)? as u64;
+                    match flush(&mut storage, session_id, &mut batch) {
+                        Ok(inserted) => stats.persisted += inserted as u64,
+                        Err(error) => {
+                            return WriterOutcome {
+                                stats,
+                                error: Some(error),
+                            }
+                        }
+                    }
                 }
             }
             Err(RecvTimeoutError::Timeout) => {
                 if !batch.is_empty() {
-                    stats.persisted += flush(&mut storage, session_id, &mut batch)? as u64;
+                    match flush(&mut storage, session_id, &mut batch) {
+                        Ok(inserted) => stats.persisted += inserted as u64,
+                        Err(error) => {
+                            return WriterOutcome {
+                                stats,
+                                error: Some(error),
+                            }
+                        }
+                    }
                 }
             }
             Err(RecvTimeoutError::Disconnected) => {
                 if !batch.is_empty() {
-                    stats.persisted += flush(&mut storage, session_id, &mut batch)? as u64;
+                    match flush(&mut storage, session_id, &mut batch) {
+                        Ok(inserted) => stats.persisted += inserted as u64,
+                        Err(error) => {
+                            return WriterOutcome {
+                                stats,
+                                error: Some(error),
+                            }
+                        }
+                    }
                 }
                 break;
             }
         }
     }
 
-    Ok(stats)
+    WriterOutcome { stats, error: None }
 }
 
 fn flush(
@@ -104,6 +140,7 @@ mod tests {
                 },
                 old_pid: Some(1),
             },
+            provenance: None,
         }
     }
 
@@ -134,8 +171,9 @@ mod tests {
         tx.send(event("s-writer", 11, 2)).unwrap();
         drop(tx);
 
-        let stats = handle.join().unwrap().unwrap();
-        assert_eq!(stats.persisted, 2);
+        let outcome = handle.join().unwrap();
+        assert!(outcome.error.is_none());
+        assert_eq!(outcome.stats.persisted, 2);
 
         let storage = Storage::open_read_only(&path).unwrap();
         assert_eq!(storage.count_events("s-writer").unwrap(), 2);

@@ -1,0 +1,260 @@
+/* Motion — the choreography of the living grid.
+   Everything is transform/opacity; drawing is stroke-dashoffset.
+   Reduced-motion collapses the entire system to instant states. */
+
+/* ------------------------------------------------ boot reveal */
+
+/* Ordered: field grid fades, frame draws, shell regions rise, data staggers.
+   Total < 700ms; never blocks interaction. */
+.boot {
+  animation: boot-field 480ms var(--ease-out) both;
+}
+
+.boot .spine {
+  animation: boot-region 420ms var(--ease-out) 40ms backwards;
+}
+
+.boot .shell-strip {
+  animation: boot-region 420ms var(--ease-out) 110ms backwards;
+}
+
+.boot .shell-content > * {
+  animation: boot-content 460ms var(--ease-out) 180ms backwards;
+}
+
+@keyframes boot-field {
+  from {
+    opacity: 0;
+  }
+}
+
+@keyframes boot-region {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+}
+
+@keyframes boot-content {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+}
+
+/* The spine rule draws downward once */
+.boot .spine::after {
+  content: "";
+  position: absolute;
+  right: -1px;
+  top: 0;
+  width: 1px;
+  height: 100%;
+  background: var(--line-2);
+  transform-origin: top;
+  animation: rule-draw 560ms var(--ease-inout) backwards;
+}
+
+@keyframes rule-draw {
+  from {
+    transform: scaleY(0);
+  }
+}
+
+/* ------------------------------------------------ page transitions */
+
+/* Route swaps re-key the page; children rise in sequence. */
+.page-enter {
+  animation: page-in 300ms var(--ease-out) backwards;
+}
+
+.page-enter > * {
+  animation: child-in 340ms var(--ease-out) backwards;
+  animation-delay: calc(var(--i, 0) * 45ms);
+}
+
+@keyframes page-in {
+  from {
+    opacity: 0;
+  }
+}
+
+@keyframes child-in {
+  from {
+    opacity: 0;
+    transform: translateY(7px);
+  }
+}
+
+/* Generic stagger helper */
+.stagger > * {
+  animation: child-in 340ms var(--ease-out) backwards;
+  animation-delay: calc(var(--i, 0) * 45ms);
+}
+
+/* Dimension swap — only the body changes; header and spine hold their place. */
+.dim-body {
+  animation: dim-in 220ms var(--ease-out) backwards;
+}
+
+@keyframes dim-in {
+  from {
+    opacity: 0;
+  }
+}
+
+/* Event detail content swaps with a short rise, not a snap. */
+.detail-enter {
+  animation: child-in 240ms var(--ease-out) backwards;
+}
+
+/* ------------------------------------------------ micro-interactions */
+
+/* Rows lift their arrow, bars grow, nodes draw — handled in screens.css.
+   Shared niceties here: */
+
+.tab-count {
+  font-family: var(--font-mono);
+  font-size: 8.5px;
+  color: var(--text-faint);
+  align-self: center;
+}
+
+/* Evidence composition bars */
+.evidence-bar-row {
+  display: grid;
+  grid-template-columns: 128px 1fr 56px;
+  align-items: center;
+  gap: 12px;
+  padding: 5px 0;
+}
+
+.evidence-bar-row + .evidence-bar-row {
+  border-top: 1px solid var(--line);
+}
+
+.evidence-bar-label {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-2);
+}
+
+.evidence-bar-track {
+  height: 3px;
+  background: var(--surface-2);
+  position: relative;
+  overflow: hidden;
+}
+
+.evidence-bar-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  background: var(--accent);
+  transform-origin: left;
+  animation: grow-x var(--dur-slow) var(--ease-out) backwards;
+}
+
+.evidence-bar-fill.t-ev-exec {
+  background: var(--ev-exec);
+}
+
+.evidence-bar-fill.t-ev-fork {
+  background: var(--ev-fork);
+}
+
+.evidence-bar-fill.t-ev-exit {
+  background: var(--ev-exit);
+}
+
+.evidence-bar-fill.t-ev-file {
+  background: var(--ev-file);
+}
+
+.evidence-bar-fill.t-ev-net {
+  background: var(--ev-net);
+}
+
+.evidence-bar-count {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-2);
+  text-align: right;
+}
+
+/* Finding summary rows on summary tab */
+.summary-finding {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 0;
+}
+
+.summary-finding + .summary-finding {
+  border-top: 1px solid var(--line);
+}
+
+.summary-finding-mark {
+  width: 6px;
+  height: 6px;
+  flex: none;
+  transform: rotate(45deg);
+}
+
+.summary-finding-mark.informational {
+  background: var(--info);
+}
+
+.summary-finding-mark.low {
+  background: var(--text-3);
+}
+
+.summary-finding-mark.medium {
+  background: var(--warning);
+}
+
+.summary-finding-mark.high {
+  background: var(--error);
+}
+
+.summary-finding-mark.critical {
+  background: var(--critical);
+}
+
+.summary-finding-title {
+  font-size: var(--fs-sm);
+  color: var(--text);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.summary-finding-meta {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  color: var(--text-faint);
+  white-space: nowrap;
+}
+
+.summary-finding .mark {
+  margin-left: auto;
+}
+
+/* ------------------------------------------------ reduced motion */
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+
+  .pg-edge.draw {
+    stroke-dasharray: none;
+    stroke-dashoffset: 0;
+    animation: none;
+  }
+}

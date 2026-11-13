@@ -1,0 +1,88 @@
+/* SYSCALL investigation system: unbleached ground, ruling ink, rubric signal. */
+
+:root {
+  /* Paper and ink */
+  --ink: #f0ede4;
+  --ink-deep: #e5e1d6;
+  --surface: #faf8f2;
+  --surface-2: #f4f1e8;
+  --surface-raise: #fffdf8;
+  --surface-inset: #eeebe2;
+
+  /* Hairline rules */
+  --line: rgba(37, 37, 33, 0.09);
+  --line-2: rgba(37, 37, 33, 0.16);
+  --line-3: rgba(37, 37, 33, 0.25);
+  --line-accent: rgba(198, 62, 47, 0.4);
+
+  /* Type */
+  --text: #23231f;
+  --text-2: #4f5049;
+  --text-3: #6c6b63;
+  --text-faint: #89867b;
+
+  /* Rubric signal */
+  --accent: #c63e2f;
+  --accent-bright: #a93125;
+  --accent-dim: rgba(198, 62, 47, 0.11);
+  --accent-dim-2: rgba(198, 62, 47, 0.055);
+  --accent-ink: #fffaf5;
+
+  /* Semantics */
+  --ok: #39734e;
+  --ok-dim: rgba(57, 115, 78, 0.1);
+  --warning: #996715;
+  --warning-dim: rgba(153, 103, 21, 0.11);
+  --error: #b43b32;
+  --error-dim: rgba(180, 59, 50, 0.1);
+  --critical: #a72c29;
+  --info: #4b7088;
+  --info-dim: rgba(75, 112, 136, 0.1);
+  --live: #39734e;
+
+  /* Event types */
+  --ev-exec: #c63e2f;
+  --ev-fork: #4b7088;
+  --ev-exit: #996715;
+  --ev-file: #676d8a;
+  --ev-net: #39734e;
+
+  /* Type families */
+  --font-ui: "Inter Variable", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-display: "Space Grotesk Variable", "Inter Variable", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono Variable", ui-monospace, "Cascadia Mono", "SF Mono", Menlo, monospace;
+
+  /* Scale */
+  --fs-micro: 10px;
+  --fs-xs: 11px;
+  --fs-sm: 12px;
+  --fs-md: 13px;
+  --fs-lg: 15px;
+  --fs-xl: 19px;
+  --fs-2xl: 26px;
+
+  /* Rhythm — 4px base, hairline borders shared */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 24px;
+  --sp-6: 32px;
+  --sp-7: 48px;
+
+  /* Motion */
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-inout: cubic-bezier(0.65, 0, 0.35, 1);
+  --ease-snap: cubic-bezier(0.2, 0.9, 0.27, 1);
+  --dur-fast: 120ms;
+  --dur: 200ms;
+  --dur-slow: 380ms;
+  --dur-draw: 640ms;
+
+  /* Shell metrics */
+  --spine-w: 224px;
+  --strip-h: 44px;
+  --radius: 0px;
+
+  color-scheme: light;
+}

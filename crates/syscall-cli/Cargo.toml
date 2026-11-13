@@ -11,10 +11,14 @@ name = "syscall"
 path = "src/main.rs"
 
 [dependencies]
+sha2.workspace = true
 anyhow.workspace = true
 clap.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+syscall-analysis = { path = "../syscall-analysis" }
 syscall-collector = { path = "../syscall-collector" }
+syscall-export = { path = "../syscall-export" }
 syscall-core = { path = "../syscall-core" }
 syscall-storage = { path = "../syscall-storage" }
 tracing.workspace = true

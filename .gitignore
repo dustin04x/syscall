@@ -1,5 +1,12 @@
 /target
 **/*.rs.bk
+
+# Desktop frontend build output and Tauri generated schemas
+/desktop/node_modules
+/desktop/dist
+/desktop/src-tauri/gen
+/ui/node_modules
+/ui/dist
 ebpf/*.o
 ebpf/vmlinux.h
 *.db
@@ -10,3 +17,6 @@ ebpf/vmlinux.h
 # Local debug/e2e artifacts
 /e2e-debug.log
 /*.log
+
+# Local design-tool state
+/ui/.impeccable/

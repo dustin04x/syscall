@@ -1,0 +1,39 @@
+[package]
+name = "syscall-desktop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Forensic investigation workbench for SYSCALL"
+
+[lib]
+name = "syscall_desktop"
+path = "src/lib.rs"
+
+[[bin]]
+name = "syscall-workbench"
+path = "src/main.rs"
+required-features = ["desktop-app"]
+
+[features]
+default = ["desktop-app"]
+desktop-app = ["dep:tauri"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+syscall-analysis = { path = "../../crates/syscall-analysis" }
+syscall-core = { path = "../../crates/syscall-core" }
+syscall-export = { path = "../../crates/syscall-export" }
+syscall-storage = { path = "../../crates/syscall-storage" }
+tauri = { version = "2", features = [], optional = true }
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

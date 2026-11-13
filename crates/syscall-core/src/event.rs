@@ -6,7 +6,14 @@ use serde::{Deserialize, Serialize};
 use crate::{CoreError, Result};
 
 /// Version of the on-disk and in-memory event schema.
-pub const SCHEMA_VERSION: u16 = 1;
+///
+/// v2 clarifies `tid` for activity events: the observed kernel thread ID is
+/// preserved for file/network events instead of being collapsed to the process
+/// TGID. Historical v1 rows remain readable with their original semantics.
+pub const SCHEMA_VERSION: u16 = 2;
+
+/// Oldest event schema version this build can read.
+pub const MIN_READABLE_SCHEMA_VERSION: u16 = 1;
 
 /// `TASK_COMM_LEN` in the Linux kernel.
 pub const COMM_LEN: usize = 16;
@@ -38,8 +45,14 @@ impl EventType {
         Self::NetworkConnect,
     ];
 
-    /// Event types implemented by Mission 01 collectors.
-    pub const COLLECTED: [Self; 3] = [Self::ProcessExec, Self::ProcessFork, Self::ProcessExit];
+    /// Event types implemented by collectors.
+    pub const COLLECTED: [Self; 5] = [
+        Self::ProcessExec,
+        Self::ProcessFork,
+        Self::ProcessExit,
+        Self::FileOpen,
+        Self::NetworkConnect,
+    ];
 
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -75,8 +88,20 @@ impl EventType {
     pub const fn is_collected(self) -> bool {
         matches!(
             self,
-            Self::ProcessExec | Self::ProcessFork | Self::ProcessExit
+            Self::ProcessExec
+                | Self::ProcessFork
+                | Self::ProcessExit
+                | Self::FileOpen
+                | Self::NetworkConnect
         )
+    }
+
+    /// Minimum wire schema version that may carry this event type.
+    pub const fn minimum_wire_schema(self) -> u16 {
+        match self {
+            Self::ProcessExec | Self::ProcessFork | Self::ProcessExit => 1,
+            Self::FileOpen | Self::NetworkConnect => 3,
+        }
     }
 }
 
@@ -97,6 +122,45 @@ impl FromStr for EventType {
             "file_open" => Ok(Self::FileOpen),
             "network_connect" => Ok(Self::NetworkConnect),
             other => Err(CoreError::UnknownEventType(other.to_owned())),
+        }
+    }
+}
+
+/// Address family of a recorded network-connect attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AddressFamily {
+    Ipv4,
+    Ipv6,
+}
+
+impl AddressFamily {
+    pub const ALL: [Self; 2] = [Self::Ipv4, Self::Ipv6];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ipv4 => "ipv4",
+            Self::Ipv6 => "ipv6",
+        }
+    }
+}
+
+impl fmt::Display for AddressFamily {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for AddressFamily {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value {
+            "ipv4" => Ok(Self::Ipv4),
+            "ipv6" => Ok(Self::Ipv6),
+            other => Err(format!(
+                "unknown address family {other:?}; expected ipv4 or ipv6"
+            )),
         }
     }
 }
@@ -135,13 +199,38 @@ pub enum EventPayload {
         process: ProcessMetadata,
         exit_priority: i32,
     },
-    /// Schema-only placeholder. Not collected in Mission 01.
-    FileOpen { path: String },
-    /// Schema-only placeholder. Not collected in Mission 01.
+    /// A file-open attempt observed at sys_exit_openat.
+    ///
+    /// `path` is the path string supplied to openat(2), not a resolved path.
+    /// Relative paths remain relative; `dirfd` records the directory base
+    /// (`-100` is `AT_FDCWD`). `result` is the raw return value: a non-negative
+    /// file descriptor on success, or a negative errno on failure.
+    FileOpen {
+        path: String,
+        path_is_absolute: bool,
+        path_truncated: bool,
+        dirfd: i32,
+        flags: u32,
+        result: i64,
+        success: bool,
+        errno: Option<i32>,
+    },
+    /// An IPv4/IPv6 connect(2) attempt observed at sys_exit_connect.
+    ///
+    /// This records an attempted connection, not an established one. `result`
+    /// is 0 on success or a negative errno on failure. Source address/port are
+    /// `None` when the hook cannot expose them reliably; they are never
+    /// guessed. `established` is always `false` for this collector.
     NetworkConnect {
-        family: String,
-        address: String,
-        port: u16,
+        family: AddressFamily,
+        source_address: Option<String>,
+        source_port: Option<u16>,
+        destination_address: String,
+        destination_port: u16,
+        result: i64,
+        success: bool,
+        errno: Option<i32>,
+        established: bool,
     },
 }
 
@@ -155,6 +244,45 @@ impl EventPayload {
             Self::NetworkConnect { .. } => EventType::NetworkConnect,
         }
     }
+}
+
+/// Provenance and attribution metadata for a persisted event.
+///
+/// Historical records may have `None`/unknown fields; code must not invent
+/// missing values. `*_pid/tgid` identities are namespace/context-specific:
+/// - `raw_bpf_*`: kernel/BPF-observed IDs from the tracepoint sample.
+/// - `observer_*`: IDs in the observer/collector PID namespace when known.
+/// - canonical fields on `Event` (`pid`, `tid`, `ppid`,
+///   `process_instance_id`) are the attributed identity used for analysis.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct EventProvenance {
+    /// Raw kernel/BPF-observed PID from the sample header.
+    #[serde(default)]
+    pub raw_bpf_pid: Option<i32>,
+    /// Raw kernel/BPF-observed TGID from the sample header.
+    #[serde(default)]
+    pub raw_bpf_tgid: Option<i32>,
+    /// Observer/collector-namespace PID when known/correlated.
+    #[serde(default)]
+    pub observer_pid: Option<i32>,
+    /// Observer/collector-namespace TGID when known/correlated (e.g. ns_tgid).
+    #[serde(default)]
+    pub observer_tgid: Option<i32>,
+    /// Source tracepoint name (e.g. `sched/sched_process_exec`).
+    #[serde(default)]
+    pub source_tracepoint: Option<String>,
+    /// Wire/event schema version of the decoded sample.
+    #[serde(default)]
+    pub wire_schema_version: Option<u16>,
+    /// Explicit attribution/evidence classification.
+    #[serde(default)]
+    pub attribution_method: Option<String>,
+    /// Clock domain of `timestamp_ns` (`wall_realtime_derived`).
+    #[serde(default)]
+    pub timestamp_clock_domain: Option<String>,
+    /// Clock domain of `monotonic_ns` (`monotonic_boot`).
+    #[serde(default)]
+    pub monotonic_clock_domain: Option<String>,
 }
 
 /// A normalized SYSCALL event.
@@ -171,6 +299,8 @@ pub struct Event {
     /// `bpf_ktime_get_ns()` value: CLOCK_MONOTONIC nanoseconds since boot.
     pub monotonic_ns: u64,
     pub pid: i32,
+    /// Observed thread ID for v2 activity events; process TGID for process
+    /// lifecycle events. v1 rows stored the process TGID here.
     pub tid: i32,
     pub uid: u32,
     pub gid: u32,
@@ -179,6 +309,9 @@ pub struct Event {
     /// Stable identity for this PID instance: boot id + pid + start time ticks.
     pub process_instance_id: String,
     pub payload: EventPayload,
+    /// Optional provenance metadata (Phase 2). Absent for legacy/historical rows.
+    #[serde(default)]
+    pub provenance: Option<EventProvenance>,
 }
 
 impl Event {
@@ -202,6 +335,14 @@ impl Event {
                 "tid must be positive, got {}",
                 self.tid
             )));
+        }
+        if self.tid != self.pid
+            && self.event_type != EventType::FileOpen
+            && self.event_type != EventType::NetworkConnect
+        {
+            return Err(CoreError::InvalidEvent(
+                "tid must equal pid for process lifecycle events".to_owned(),
+            ));
         }
         if self.timestamp_ns <= 0 {
             return Err(CoreError::InvalidEvent(
@@ -284,10 +425,61 @@ impl Event {
                 }
             }
             EventPayload::ProcessExit { .. } => {}
-            EventPayload::FileOpen { .. } | EventPayload::NetworkConnect { .. } => {
-                return Err(CoreError::InvalidEvent(
-                    "schema-only event type must not be persisted".to_owned(),
-                ));
+            EventPayload::FileOpen {
+                path,
+                path_truncated,
+                result,
+                success,
+                errno,
+                ..
+            } => {
+                if path.len() > MAX_FILENAME_LEN {
+                    return Err(CoreError::InvalidEvent(format!(
+                        "file path is {} bytes, limit is {MAX_FILENAME_LEN}",
+                        path.len()
+                    )));
+                }
+                if path.as_bytes().contains(&0) {
+                    return Err(CoreError::InvalidEvent(
+                        "file path contains a NUL byte".to_owned(),
+                    ));
+                }
+                if *path_truncated && path.is_empty() {
+                    return Err(CoreError::InvalidEvent(
+                        "file path cannot be empty when marked truncated".to_owned(),
+                    ));
+                }
+                validate_result_semantics("file_open", *result, *success, *errno, true)?;
+            }
+            EventPayload::NetworkConnect {
+                family,
+                source_address,
+                source_port,
+                destination_address,
+                result,
+                success,
+                errno,
+                established,
+                ..
+            } => {
+                if *established {
+                    return Err(CoreError::InvalidEvent(
+                        "network_connect records an attempt, not an established connection"
+                            .to_owned(),
+                    ));
+                }
+                validate_result_semantics("network_connect", *result, *success, *errno, false)?;
+                validate_address("destination", *family, destination_address)?;
+                match (source_address, source_port) {
+                    (Some(address), Some(_)) => validate_address("source", *family, address)?,
+                    (None, None) => {}
+                    _ => {
+                        return Err(CoreError::InvalidEvent(
+                            "network source address and port must both be present or absent"
+                                .to_owned(),
+                        ))
+                    }
+                }
             }
         }
 
@@ -298,6 +490,58 @@ impl Event {
         }
 
         Ok(())
+    }
+}
+
+fn validate_result_semantics(
+    kind: &str,
+    result: i64,
+    success: bool,
+    errno: Option<i32>,
+    non_negative_is_success: bool,
+) -> Result<()> {
+    let expected_success = if non_negative_is_success {
+        result >= 0
+    } else {
+        result == 0
+    };
+    if success != expected_success {
+        return Err(CoreError::InvalidEvent(format!(
+            "{kind} success flag disagrees with result {result}"
+        )));
+    }
+    if success {
+        if errno.is_some() {
+            return Err(CoreError::InvalidEvent(format!(
+                "{kind} success must not carry an errno"
+            )));
+        }
+        return Ok(());
+    }
+    let expected_errno = result
+        .checked_neg()
+        .filter(|value| *value > 0 && *value <= i64::from(i32::MAX));
+    match (expected_errno, errno) {
+        (Some(expected), Some(actual)) if i64::from(actual) == expected => Ok(()),
+        _ => Err(CoreError::InvalidEvent(format!(
+            "{kind} failure result/errno is inconsistent ({result} / {errno:?})"
+        ))),
+    }
+}
+
+fn validate_address(kind: &str, family: AddressFamily, address: &str) -> Result<()> {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    let valid = match family {
+        AddressFamily::Ipv4 => address.parse::<Ipv4Addr>().is_ok(),
+        AddressFamily::Ipv6 => address.parse::<Ipv6Addr>().is_ok(),
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(CoreError::InvalidEvent(format!(
+            "{kind} address {address:?} is not a valid {family} address"
+        )))
     }
 }
 
@@ -346,6 +590,7 @@ mod tests {
                 },
                 old_pid: Some(41),
             },
+            provenance: None,
         }
     }
 
@@ -372,12 +617,55 @@ mod tests {
     }
 
     #[test]
-    fn schema_only_events_are_rejected_by_storage_validation() {
+    fn file_open_payload_validates_result_semantics() {
         let mut event = exec_event();
         event.event_type = EventType::FileOpen;
         event.payload = EventPayload::FileOpen {
             path: "/etc/passwd".to_owned(),
+            path_is_absolute: true,
+            path_truncated: false,
+            dirfd: -100,
+            flags: 0,
+            result: 5,
+            success: true,
+            errno: None,
         };
+        event.validate().unwrap();
+
+        if let EventPayload::FileOpen {
+            result, success, ..
+        } = &mut event.payload
+        {
+            *result = -2;
+            *success = true;
+        }
+        assert!(event.validate().is_err());
+    }
+
+    #[test]
+    fn network_connect_payload_validates_family_and_attempt_semantics() {
+        let mut event = exec_event();
+        event.event_type = EventType::NetworkConnect;
+        event.payload = EventPayload::NetworkConnect {
+            family: AddressFamily::Ipv4,
+            source_address: None,
+            source_port: None,
+            destination_address: "93.184.216.34".to_owned(),
+            destination_port: 443,
+            result: 0,
+            success: true,
+            errno: None,
+            established: false,
+        };
+        event.validate().unwrap();
+
+        if let EventPayload::NetworkConnect {
+            destination_address,
+            ..
+        } = &mut event.payload
+        {
+            *destination_address = "2001:db8::1".to_owned();
+        }
         assert!(event.validate().is_err());
     }
 
@@ -440,7 +728,7 @@ mod tests {
         assert!(EventType::ProcessExec.is_collected());
         assert!(EventType::ProcessFork.is_collected());
         assert!(EventType::ProcessExit.is_collected());
-        assert!(!EventType::FileOpen.is_collected());
-        assert!(!EventType::NetworkConnect.is_collected());
+        assert!(EventType::FileOpen.is_collected());
+        assert!(EventType::NetworkConnect.is_collected());
     }
 }

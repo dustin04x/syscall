@@ -129,8 +129,12 @@ mod tests {
     fn inspect_reports_event_types() {
         let report = inspect(Some(PathBuf::from("/nonexistent/syscall.db")));
         assert_eq!(report.core_schema_version, SCHEMA_VERSION);
-        assert_eq!(report.collected_event_types.len(), 3);
-        assert_eq!(report.schema_only_event_types.len(), 2);
+        assert_eq!(report.collected_event_types.len(), 5);
+        assert_eq!(report.schema_only_event_types.len(), 0);
+        assert!(report.collected_event_types.contains(&EventType::FileOpen));
+        assert!(report
+            .collected_event_types
+            .contains(&EventType::NetworkConnect));
         assert!(!report.database_exists);
     }
 }

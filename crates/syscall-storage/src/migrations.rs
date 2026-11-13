@@ -3,17 +3,35 @@ use rusqlite::Connection;
 use crate::error::{Result, StorageError};
 
 /// Latest schema version. Bump only with an accompanying migration.
-pub const LATEST_SCHEMA_VERSION: u32 = 1;
+pub const LATEST_SCHEMA_VERSION: u32 = 5;
 
 struct Migration {
     version: u32,
     sql: &'static str,
 }
 
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    sql: include_str!("../migrations/001_initial.sql"),
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        sql: include_str!("../migrations/001_initial.sql"),
+    },
+    Migration {
+        version: 2,
+        sql: include_str!("../migrations/002_session_integrity.sql"),
+    },
+    Migration {
+        version: 3,
+        sql: include_str!("../migrations/003_event_provenance.sql"),
+    },
+    Migration {
+        version: 4,
+        sql: include_str!("../migrations/004_activity_events.sql"),
+    },
+    Migration {
+        version: 5,
+        sql: include_str!("../migrations/005_evidence_accounting.sql"),
+    },
+];
 
 fn user_version(conn: &Connection) -> Result<u32> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;

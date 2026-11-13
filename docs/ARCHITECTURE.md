@@ -2,8 +2,8 @@
 
 ## Goals
 
-Mission 01 must produce **real** process lifecycle telemetry, not simulated
-events. The design therefore separates five concerns:
+SYSCALL must produce **real** process, filesystem, and network telemetry, not
+simulated events. The design therefore separates five concerns:
 
 1. Kernel collection with a minimal, verifiable eBPF surface.
 2. Strict decoding of untrusted kernel samples.
@@ -18,6 +18,7 @@ events. The design therefore separates five concerns:
 | `syscall-core` | Domain model, schema versions, event validation, IDs, clocks, paths, scope vocabulary |
 | `syscall-storage` | SQLite schema, migrations, sessions, batched event insert, read-only queries |
 | `syscall-collector` | eBPF skeleton, tracepoint programs, ring-buffer decode, scope attribution, writer, orchestration |
+| `syscall-analysis` | Read-only evidence context, deterministic rules A–F, strict configuration, report assembly |
 | `syscall-cli` | Clap commands, text/JSON rendering, exit-code policy |
 
 `syscall-core` has no eBPF or SQLite dependency. `syscall-storage` has no eBPF
@@ -25,11 +26,31 @@ dependency. This keeps the event contract and database independently testable.
 
 ## Kernel side
 
-`ebpf/syscall.bpf.c` attaches to three stable scheduler tracepoints:
+`ebpf/syscall.bpf.c` attaches to seven stable tracepoints: three scheduler
+lifecycle hooks and two syscall enter/exit pairs.
+
+Process lifecycle:
 
 - `tracepoint/sched/sched_process_exec`
 - `tracepoint/sched/sched_process_fork`
 - `tracepoint/sched/sched_process_exit`
+
+Filesystem activity:
+
+- `tracepoint/syscalls/sys_enter_openat` and `syscalls/sys_exit_openat`
+
+Network activity:
+
+- `tracepoint/syscalls/sys_enter_connect` and `syscalls/sys_exit_connect`
+
+The syscall hooks are paired in userspace-BPF maps keyed by
+`bpf_get_current_pid_tgid()`. Each of `openat_args` and `connect_args` is a
+bounded `BPF_MAP_TYPE_LRU_HASH` (8192 entries). Enter stores the arguments;
+exit looks up and removes the entry, so one attempt produces at most one event.
+A missing enter or an LRU eviction produces no event rather than a fabricated
+one. Events are emitted only at exit, carrying the raw return value, which makes
+attempt-versus-success explicit. The hook does not resolve paths, perform DNS,
+or inspect payloads.
 
 It uses fixed-size local structs instead of `vmlinux.h`/CO-RE. The context
 layouts were verified against the running kernel BTF and are protected by
@@ -43,8 +64,11 @@ layouts were verified against the running kernel BTF and are protected by
 
 The programs write to a 4 MiB `BPF_MAP_TYPE_RINGBUF`. A one-entry array map
 accumulates ring-buffer output failures so userspace can persist a real loss
-counter. The eBPF side performs no filtering and no allocations beyond the
-fixed stack event.
+counter. Not all retention failures are counted: a missing syscall enter or LRU
+pairing-map eviction silently yields no activity event and is a documented gap.
+The eBPF side performs no filtering and no allocations beyond fixed stack
+storage; the file-open event is ring-buffer reserved because its 336-byte event
+plus 272-byte pairing arguments exceed the 512-byte BPF stack limit.
 
 The target filename in the exec tracepoint is a `__data_loc` string. The low 16
 bits are an offset from the tracepoint context; `bpf_probe_read_kernel_str`
@@ -53,8 +77,11 @@ copies it with a hard 256-byte bound and the header records the actual length.
 ## Wire format
 
 The wire header is 56 bytes and carries magic, wire schema version, event type,
-monotonic timestamp, pid, tgid, uid, gid, comm, payload length, and reserved
-space. Samples are 320 bytes (exec), 96 bytes (fork), and 64 bytes (exit).
+monotonic timestamp, pid, tgid, uid, gid, comm, payload length, and the
+observer-namespace `ns_tgid`. Samples are 320 bytes (exec), 96 bytes (fork),
+64 bytes (exit), 336 bytes (file-open), and 104 bytes (network-connect). Wire v3
+adds the activity types; v1/v2 process samples remain decodable, while activity
+types require v3.
 
 The Rust decoder never trusts lengths or strings. It checks magic, schema
 version, event type, minimum sample size, payload length bounds, payload end
@@ -87,12 +114,19 @@ works. This is deliberate: forensic data must remain readable.
 
 ## Scope semantics
 
-The kernel tracepoints are system-wide. Mission 01 does **not** install a
+The kernel tracepoints are system-wide. SYSCALL does **not** install a
 kernel-side PID or cgroup filter. `RecordingScope` therefore describes
 userspace attribution:
 
 - `target-tree`: include the launched target and descendants.
-- `system`: include every process lifecycle event observed.
+- `system`: include every collected event observed.
+
+The same tracked-instance contract applies to file-open and network-connect
+events. Activity attribution reads `/proc/<tgid>` (or the namespace-correlated
+TGID passed by BPF), resolves the observed identity through the scope tracker,
+and rejects unknown processes in target-tree mode. No activity event is
+attributed to a PID merely because the number matches; start-time and lineage
+checks still apply.
 
 Target-tree attribution:
 
@@ -104,7 +138,9 @@ Target-tree attribution:
    `/proc/<child>/status` has `Tgid == Pid`; the same check handles thread exits.
 5. A PID with a different `start_time_ticks` than the cached instance is treated
    as reused and is not admitted without new lineage.
-6. The tracked-process table is capped at 65,536 entries. Events for new
+6. The tracked-process table is capped at 65,536 entries. Namespace aliases and
+   unresolved-fork buffering are separately capped; overflow fork entries are
+   emitted as explicitly unresolved rather than silently dropped. Events for new
    processes beyond the cap are treated as filtered and counted, so a fork bomb
    cannot grow userspace memory without bound.
 
@@ -144,7 +180,9 @@ database and JSON output.
   bounded `sync_channel` of 8192 events; a full channel increments the
   userspace-drop counter.
 - A dedicated writer thread owns its own SQLite connection, batches up to 256
-  events or 200 ms, and commits each batch in one transaction.
+  events or 200 ms, and commits each batch in one transaction. If a later batch
+  fails, the writer reports the committed count and error separately so partial
+  evidence is still accounted for.
 - Inspection commands open the database read-only and verify `PRAGMA
   user_version` before querying.
 - All SQL values are bound parameters. Event queries support session id, event
@@ -161,12 +199,37 @@ database and JSON output.
 | Event filtered by scope | Counted as filtered, session continues |
 | Bounded channel full | Counted as userspace dropped, session continues |
 | Ring buffer output failure | eBPF counter, read and persisted at session end |
-| Writer/SQLite failure | Session marked `failed`, error persisted |
+| Writer/SQLite failure | Session marked `failed`, error persisted; already-committed rows remain and are reported |
 | Target exits | Drain window of 750 ms, then finalize; detached descendants that outlive the target are not followed |
 | Ctrl+C / SIGTERM | Mark interrupted, SIGTERM target group, 2 s grace, SIGKILL if needed, 500 ms drain, exit 130 |
 | Recorder panic/unwind | Drop guard marks session `failed` |
 | Hard crash | Session remains `recording` but is inspectable read-only |
 | PID reuse | Distinct process instance identity; no inherited target-tree trust |
+| Missing syscall enter/exit or pairing-map eviction | No activity event emitted; not separately counted (documented gap) |
+| Relative path | Raw path persisted with `path_is_absolute=false` and `dirfd`; collector does not resolve |
+| IPv4/IPv6 connect | Family/address/port persisted; success only means `connect()` returned 0; source usually unavailable |
+
+## Behavioral analysis
+
+Phase 6 adds an offline analysis subsystem rather than putting rules in the
+collector hot path. `syscall-analysis` reads persisted evidence through existing
+bounded storage APIs and emits versioned findings whose supporting events are
+referenced by original row ID. The shared result model lives in `syscall-core`;
+CLI rendering and export assembly remain in `syscall-cli`.
+
+Analysis is read-only: it does not migrate, update, or execute recorded
+commands. Event scanning is bounded by `max_events`, findings by `max_findings`,
+and per-rule work is bounded (for example, shell traversal and process-tree
+correlation caps). Rule F groups events by process instance once rather than
+rescanning the full event list per process.
+
+Evidence completeness is explicit. Losses, userspace drops, malformed events,
+persistence failures, unresolved identity/ancestry, non-terminal sessions, and
+truncated scans reduce confidence and appear in report limitations. Verification
+is read-only; analysis does not claim database authenticity.
+
+See [ANALYSIS.md](ANALYSIS.md) for exact rule conditions, severity/confidence
+semantics, configuration defaults, CLI examples, and export integration.
 
 ## Tradeoffs
 
@@ -177,5 +240,10 @@ database and JSON output.
   may discard.
 - One writer thread and one read-only connection per inspection command keep the
   design small. There is no concurrent multi-reader aggregation layer.
+- Activity is sampled at syscall exit. This is portable across filesystems and
+  protocols but cannot prove data access, TCP/UDP, or connection establishment;
+  deeper hooks would add kernel-version and attribution risk.
+- Only `openat` and `connect` are captured. `open`, `openat2`, `sendto`,
+  `sendmsg`, and `accept` are not part of Phase 5.
 - The wall-clock offset is captured once. This favors internal consistency over
   responding to clock steps mid-session.

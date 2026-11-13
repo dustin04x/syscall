@@ -20,6 +20,9 @@ const MAX_ANCESTRY_DEPTH: usize = 64;
 /// Hard cap on live tracked processes. A fork bomb must not grow userspace
 /// memory without bound; events beyond the cap are reported as filtered.
 pub const MAX_TRACKED_PROCESSES: usize = 65_536;
+/// Alias entries are normally a handful per process, but namespace churn must
+/// not grow this map without bound.
+pub const MAX_ALIASES: usize = MAX_TRACKED_PROCESSES * 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrackedProcess {
@@ -100,13 +103,29 @@ impl ScopeTracker {
     }
 
     /// Register PID namespace aliases for a canonical tracked TGID.
-    pub fn register_aliases(&mut self, canonical: i32, aliases: &[i32]) {
+    pub fn register_aliases(&mut self, canonical: i32, alias_pids: &[i32]) {
         if canonical <= 0 {
             return;
         }
+        if self.aliases.len() >= MAX_ALIASES {
+            let stale: Vec<i32> = self
+                .aliases
+                .iter()
+                .filter(|(_, mapped)| {
+                    !self.tracked.contains_key(*mapped) && self.root_pid != Some(**mapped)
+                })
+                .map(|(alias, _)| *alias)
+                .collect();
+            for alias in stale {
+                self.aliases.remove(&alias);
+            }
+        }
+        if self.aliases.len() >= MAX_ALIASES {
+            return;
+        }
         self.aliases.insert(canonical, canonical);
-        for &alias in aliases {
-            if alias > 0 {
+        for &alias in alias_pids {
+            if alias > 0 && self.aliases.len() < MAX_ALIASES {
                 self.aliases.insert(alias, canonical);
             }
         }
@@ -400,6 +419,8 @@ impl ScopeTracker {
         }
         self.tracked.remove(&canonical);
         self.tracked.remove(&tgid);
+        self.aliases
+            .retain(|_, mapped| *mapped != canonical && *mapped != tgid);
     }
 
     pub fn get(&self, tgid: i32) -> Option<&TrackedProcess> {

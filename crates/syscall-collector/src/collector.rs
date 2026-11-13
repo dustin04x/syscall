@@ -25,7 +25,9 @@ use syscall_core::ids;
 use syscall_core::{
     Event, EventPayload, EventType, ProcessMetadata, RecordingScope, COMM_LEN, SCHEMA_VERSION,
 };
-use syscall_storage::{NewSession, SessionFinish, SessionStatus, Storage, StorageError};
+use syscall_storage::{
+    lock, NewSession, SessionFinish, SessionLock, SessionStatus, Storage, StorageError,
+};
 use thiserror::Error;
 
 use crate::bpf::SyscallSkelBuilder;
@@ -35,6 +37,9 @@ use crate::scope::{Attribution, ScopeTracker};
 use crate::{privilege, signal, writer};
 
 const CHANNEL_CAPACITY: usize = 8192;
+/// Bound unresolved fork buffering. When full, the oldest entry is emitted as
+/// an explicit unresolved fork instead of being dropped silently.
+const MAX_BUFFERED_FORKS: usize = 4096;
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const DRAIN_AFTER_TARGET_EXIT: Duration = Duration::from_millis(750);
 const SIGTERM_GRACE: Duration = Duration::from_secs(2);
@@ -116,6 +121,8 @@ pub struct RecordReport {
     pub events_persisted: u64,
     /// Total filtered/rejected events (thread context + out of scope).
     pub events_filtered: u64,
+    /// Samples discarded because the collector generated them itself.
+    pub events_self_filtered: u64,
     pub malformed_events: u64,
     pub ringbuf_lost_events: u64,
     pub userspace_dropped_events: u64,
@@ -233,6 +240,12 @@ pub fn record(request: RecordRequest) -> Result<RecordReport, CollectorError> {
         libc::umask(0o077);
     }
 
+    // Hold an exclusive per-session ownership lock for the full recording
+    // lifetime so recovery cannot reclaim an active collector. Acquire it
+    // after privilege drop so `<db>.locks/` and its file are owned by the
+    // invoking user; otherwise the unprivileged writer cannot open them.
+    let _session_lock: SessionLock = lock::acquire_exclusive(&request.database_path, &session_id)?;
+
     // ----- Phase 3: session metadata and writer --------------------------
     let started_at_ns = clock::realtime_now_ns()?;
     let storage = Storage::open(&request.database_path)?;
@@ -318,6 +331,8 @@ pub fn record(request: RecordRequest) -> Result<RecordReport, CollectorError> {
 
     // ----- Phase 5: ring buffer and callback -----------------------------
     let (event_tx, event_rx) = sync_channel::<Event>(CHANNEL_CAPACITY);
+    let collector_pid = std::process::id() as i32;
+    let self_samples = AtomicU64::new(0);
     let channel_dropped = AtomicU64::new(0);
     let malformed = AtomicU64::new(0);
     let ring_samples = AtomicU64::new(0);
@@ -338,6 +353,14 @@ pub fn record(request: RecordRequest) -> Result<RecordReport, CollectorError> {
             match event_decoder::decode(data) {
                 Ok(raw) => {
                     decoded.fetch_add(1, Ordering::Relaxed);
+                    // The collector's own /proc enrichment opens files. Those
+                    // openat events would themselves trigger more enrichment,
+                    // creating an unbounded feedback loop inside ring.poll().
+                    // Drop self-originated samples before any build_event call.
+                    if is_collector_self(&raw, collector_pid) {
+                        self_samples.fetch_add(1, Ordering::Relaxed);
+                        return 0;
+                    }
                     match raw.event_type {
                         EventType::ProcessExec => {
                             decoded_exec.fetch_add(1, Ordering::Relaxed);
@@ -424,6 +447,7 @@ pub fn record(request: RecordRequest) -> Result<RecordReport, CollectorError> {
     let writer_result = writer_handle.join();
     let ended_at_ns = clock::realtime_now_ns().unwrap_or(started_at_ns);
 
+    let self_samples_count = self_samples.load(Ordering::Relaxed);
     let rejections = RejectionBreakdown {
         ring_samples: ring_samples.load(Ordering::Relaxed),
         decoded: decoded.load(Ordering::Relaxed),
@@ -471,6 +495,7 @@ pub fn record(request: RecordRequest) -> Result<RecordReport, CollectorError> {
         decoded_exit = rejections.decoded_exit,
         rejected_thread = rejections.thread_context,
         rejected_out_of_scope = rejections.out_of_scope,
+        collector_self_samples = self_samples_count,
         root_canonical_pid = scope.root_pid().unwrap_or(root_proc_pid),
         root_proc_pid,
         "ring-buffer attribution summary"
@@ -489,16 +514,33 @@ pub fn record(request: RecordRequest) -> Result<RecordReport, CollectorError> {
                 malformed_events: malformed.load(Ordering::Relaxed),
                 filtered_events,
                 error: Some(err.to_string()),
+                termination_reason: Some("collector_error".to_owned()),
+                target_exit_code: None,
+                target_exit_signal: None,
+                recovered_from_status: None,
+                recovered_at_ns: None,
+                finalized_at_ns: Some(ended_at_ns),
+                events_received: rejections.ring_samples,
+                events_decoded: rejections.decoded,
+                events_attributed: rejections
+                    .decoded
+                    .saturating_sub(filtered_events + self_samples_count),
+                events_persisted: 0,
+                events_rejected_scope: rejections.out_of_scope,
+                events_rejected_malformed: malformed.load(Ordering::Relaxed),
+                events_persist_failed: 0,
+                events_self_filtered: self_samples_count,
             });
             return Err(err);
         }
     };
 
     let (writer_stats, writer_error) = match writer_result {
-        Ok(Ok(stats)) => (stats, None),
-        Ok(Err(err)) => (
-            writer::WriterStats::default(),
-            Some(format!("event writer failed: {err}")),
+        Ok(outcome) => (
+            outcome.stats,
+            outcome
+                .error
+                .map(|err| format!("event writer failed: {err}")),
         ),
         Err(_) => (
             writer::WriterStats::default(),
@@ -518,6 +560,18 @@ pub fn record(request: RecordRequest) -> Result<RecordReport, CollectorError> {
         SessionStatus::Completed
     };
 
+    let target_outcome = poll_outcome.exit_status.map(|status| TargetOutcome {
+        exit_code: status.code(),
+        signal: status.signal(),
+    });
+    let termination_reason = if writer_error.is_some() {
+        Some("storage_write_failure".to_owned())
+    } else if poll_outcome.interrupt_signal.is_some() {
+        Some("interrupted".to_owned())
+    } else {
+        Some("target_exit".to_owned())
+    };
+
     session_guard.finish(SessionFinish {
         ended_at_ns,
         status,
@@ -527,18 +581,30 @@ pub fn record(request: RecordRequest) -> Result<RecordReport, CollectorError> {
         malformed_events,
         filtered_events,
         error: writer_error.clone(),
+        termination_reason,
+        target_exit_code: target_outcome.as_ref().and_then(|t| t.exit_code),
+        target_exit_signal: target_outcome.as_ref().and_then(|t| t.signal),
+        recovered_from_status: None,
+        recovered_at_ns: None,
+        finalized_at_ns: Some(ended_at_ns),
+        events_received: rejections.ring_samples,
+        events_decoded: rejections.decoded,
+        events_attributed: rejections.decoded.saturating_sub(
+            rejections.thread_context + rejections.out_of_scope + self_samples_count,
+        ),
+        events_persisted: writer_stats.persisted,
+        events_rejected_scope: rejections.out_of_scope,
+        events_rejected_malformed: malformed_events,
+        events_persist_failed: if writer_error.is_some() { 1 } else { 0 },
+        events_self_filtered: self_samples_count,
     })?;
-
-    let target_outcome = poll_outcome.exit_status.map(|status| TargetOutcome {
-        exit_code: status.code(),
-        signal: status.signal(),
-    });
 
     Ok(RecordReport {
         session_id,
         status,
         events_persisted: writer_stats.persisted,
         events_filtered: filtered_events,
+        events_self_filtered: self_samples_count,
         malformed_events,
         ringbuf_lost_events: ringbuf_lost,
         userspace_dropped_events: userspace_dropped,
@@ -682,6 +748,84 @@ fn log_rejection(raw: &DecodedEvent, reason: RejectReason, root_pid: Option<i32>
                 "rejected event"
             );
         }
+        DecodedPayload::FileOpen { path, result, .. } => {
+            tracing::debug!(
+                event_type = %raw.event_type,
+                bpf_pid = raw.pid,
+                bpf_tgid = raw.tgid,
+                ns_tgid = ?ns_tgid,
+                comm = %raw.comm,
+                path = %path,
+                result,
+                ?root_pid,
+                tracked,
+                ?reason,
+                "rejected event"
+            );
+        }
+        DecodedPayload::NetworkConnect {
+            destination_address,
+            destination_port,
+            result,
+            ..
+        } => {
+            tracing::debug!(
+                event_type = %raw.event_type,
+                bpf_pid = raw.pid,
+                bpf_tgid = raw.tgid,
+                ns_tgid = ?ns_tgid,
+                comm = %raw.comm,
+                destination_address = %destination_address,
+                destination_port,
+                result,
+                ?root_pid,
+                tracked,
+                ?reason,
+                "rejected event"
+            );
+        }
+    }
+}
+
+/// True when a sample was generated by the collector process itself.
+///
+/// `ns_tgid` is the observer-namespace TGID and is the most reliable match;
+/// the raw PID/TGID checks cover configurations where the namespace helper is
+/// unavailable. Filtering here, before procfs enrichment, is what prevents the
+/// collector's own `/proc` reads from recursively generating file-open events.
+fn is_collector_self(raw: &DecodedEvent, collector_pid: i32) -> bool {
+    raw.pid == collector_pid || raw.tgid == collector_pid || raw.ns_tgid == collector_pid
+}
+
+fn source_tracepoint(event_type: EventType) -> &'static str {
+    match event_type {
+        EventType::ProcessExec => "sched/sched_process_exec",
+        EventType::ProcessFork => "sched/sched_process_fork",
+        EventType::ProcessExit => "sched/sched_process_exit",
+        EventType::FileOpen => "syscalls/sys_exit_openat",
+        EventType::NetworkConnect => "syscalls/sys_exit_connect",
+    }
+}
+
+fn event_provenance(
+    raw: &DecodedEvent,
+    attribution_method: &'static str,
+) -> syscall_core::EventProvenance {
+    let ns_tgid = if raw.ns_tgid > 0 {
+        Some(raw.ns_tgid)
+    } else {
+        None
+    };
+    syscall_core::EventProvenance {
+        raw_bpf_pid: Some(raw.pid),
+        raw_bpf_tgid: Some(raw.tgid),
+        observer_pid: ns_tgid,
+        observer_tgid: ns_tgid,
+        source_tracepoint: Some(source_tracepoint(raw.event_type).to_owned()),
+        wire_schema_version: Some(raw.wire_schema_version),
+        attribution_method: Some(attribution_method.to_owned()),
+        timestamp_clock_domain: Some("wall_realtime_derived".to_owned()),
+        monotonic_clock_domain: Some("monotonic_boot_raw".to_owned()),
     }
 }
 
@@ -690,7 +834,7 @@ fn build_event(
     scope: &mut ScopeTracker,
     fork_buffer: &mut HashMap<i32, BufferedFork>,
     session_id: &str,
-    _boot_id: &str,
+    boot_id: &str,
     clock_offset: i64,
 ) -> BuildOutcome {
     let timestamp_ns = clock::wall_from_monotonic(clock_offset, raw.monotonic_ns);
@@ -765,6 +909,11 @@ fn build_event(
             }
             let uid = info.as_ref().map(|value| value.uid).unwrap_or(raw.uid);
             let gid = info.as_ref().map(|value| value.gid).unwrap_or(raw.gid);
+            let attr_method = if ns_tgid.is_some() {
+                "ns_tgid_correlated"
+            } else {
+                "raw_bpf_or_procfs"
+            };
             events.push(Event {
                 id: None,
                 session_id: session_id.to_owned(),
@@ -787,6 +936,7 @@ fn build_event(
                     },
                     old_pid: (*old_pid > 0).then_some(*old_pid),
                 },
+                provenance: Some(event_provenance(raw, attr_method)),
             });
             BuildOutcome::Included(events)
         }
@@ -883,6 +1033,11 @@ fn build_event(
                     process_instance_id = %tracked.process_instance_id,
                     "identity chain: raw_bpf -> verified/canonical (scope attributed fork)"
                 );
+                let attr_method = if ns_tgid.is_some() {
+                    "ns_tgid_correlated"
+                } else {
+                    "observer_pid_verified"
+                };
                 return BuildOutcome::Included(vec![Event {
                     id: None,
                     session_id: session_id.to_owned(),
@@ -904,6 +1059,7 @@ fn build_event(
                         child_comm: tracked.comm.clone(),
                         child_start_time_ticks: tracked.start_time_ticks,
                     },
+                    provenance: Some(event_provenance(raw, attr_method)),
                 }]);
             }
 
@@ -935,6 +1091,24 @@ fn build_event(
                 process_instance_id = %provisional.process_instance_id,
                 "fork buffered: child observer identity unknown; awaiting ns_tgid on exec/exit"
             );
+            let mut flushed = Vec::new();
+            while fork_buffer.len() >= MAX_BUFFERED_FORKS {
+                let Some(oldest_tgid) = fork_buffer
+                    .iter()
+                    .min_by_key(|(_, buffered)| (buffered.timestamp_ns, buffered.monotonic_ns))
+                    .map(|(pid, _)| *pid)
+                else {
+                    break;
+                };
+                let Some(oldest) = fork_buffer.remove(&oldest_tgid) else {
+                    break;
+                };
+                if let Some(event) =
+                    flush_unresolved_fork(oldest, oldest_tgid, boot_id, session_id, scope)
+                {
+                    flushed.push(event);
+                }
+            }
             fork_buffer.insert(
                 child_tgid,
                 BufferedFork {
@@ -945,7 +1119,7 @@ fn build_event(
                     gid,
                 },
             );
-            BuildOutcome::Included(vec![])
+            BuildOutcome::Included(flushed)
         }
 
         DecodedPayload::Exit { exit_priority } => {
@@ -1007,6 +1181,11 @@ fn build_event(
             }
             let uid = info.as_ref().map(|value| value.uid).unwrap_or(raw.uid);
             let gid = info.as_ref().map(|value| value.gid).unwrap_or(raw.gid);
+            let attr_method = if ns_tgid.is_some() {
+                "ns_tgid_correlated"
+            } else {
+                "raw_bpf_or_procfs"
+            };
             let event = Event {
                 id: None,
                 session_id: session_id.to_owned(),
@@ -1028,10 +1207,148 @@ fn build_event(
                     },
                     exit_priority: *exit_priority,
                 },
+                provenance: Some(event_provenance(raw, attr_method)),
             };
             scope.mark_exited(tracked.tgid);
             events.push(event);
             BuildOutcome::Included(events)
+        }
+
+        DecodedPayload::FileOpen {
+            path,
+            path_is_absolute,
+            path_truncated,
+            dirfd,
+            flags,
+            result,
+        } => {
+            let info = procfs::read(raw.tgid).or_else(|| ns_tgid.and_then(procfs::read));
+            let cached = scope
+                .get(raw.tgid)
+                .or_else(|| ns_tgid.and_then(|id| scope.get(id)));
+            let ppid = info
+                .as_ref()
+                .map(|value| value.ppid)
+                .or_else(|| cached.and_then(|value| value.ppid));
+            let start_time_ticks = info
+                .as_ref()
+                .and_then(|value| value.start_time_ticks)
+                .or_else(|| cached.and_then(|value| value.start_time_ticks));
+            let comm = normalize_comm(&raw.comm, info.as_ref().map(|value| value.comm.as_str()));
+            let Attribution::Included(tracked) = scope.resolve_observed(
+                raw.tgid,
+                ns_tgid,
+                ppid,
+                None,
+                start_time_ticks,
+                &comm,
+                raw.monotonic_ns,
+            ) else {
+                return BuildOutcome::Rejected(RejectReason::OutOfScope);
+            };
+            let success = *result >= 0;
+            let errno = if success {
+                None
+            } else {
+                result
+                    .checked_neg()
+                    .and_then(|value| i32::try_from(value).ok())
+            };
+            BuildOutcome::Included(vec![Event {
+                id: None,
+                session_id: session_id.to_owned(),
+                schema_version: SCHEMA_VERSION,
+                event_type: EventType::FileOpen,
+                timestamp_ns,
+                monotonic_ns: raw.monotonic_ns,
+                pid: tracked.tgid,
+                tid: raw.pid,
+                uid: info.as_ref().map(|value| value.uid).unwrap_or(raw.uid),
+                gid: info.as_ref().map(|value| value.gid).unwrap_or(raw.gid),
+                ppid: tracked.ppid.or(ppid),
+                comm: tracked.comm.clone(),
+                process_instance_id: tracked.process_instance_id.clone(),
+                payload: EventPayload::FileOpen {
+                    path: path.clone(),
+                    path_is_absolute: *path_is_absolute,
+                    path_truncated: *path_truncated,
+                    dirfd: *dirfd,
+                    flags: *flags,
+                    result: *result,
+                    success,
+                    errno,
+                },
+                provenance: Some(event_provenance(raw, "syscall_pair_attributed")),
+            }])
+        }
+
+        DecodedPayload::NetworkConnect {
+            family,
+            source_address,
+            source_port,
+            destination_address,
+            destination_port,
+            result,
+        } => {
+            let info = procfs::read(raw.tgid).or_else(|| ns_tgid.and_then(procfs::read));
+            let cached = scope
+                .get(raw.tgid)
+                .or_else(|| ns_tgid.and_then(|id| scope.get(id)));
+            let ppid = info
+                .as_ref()
+                .map(|value| value.ppid)
+                .or_else(|| cached.and_then(|value| value.ppid));
+            let start_time_ticks = info
+                .as_ref()
+                .and_then(|value| value.start_time_ticks)
+                .or_else(|| cached.and_then(|value| value.start_time_ticks));
+            let comm = normalize_comm(&raw.comm, info.as_ref().map(|value| value.comm.as_str()));
+            let Attribution::Included(tracked) = scope.resolve_observed(
+                raw.tgid,
+                ns_tgid,
+                ppid,
+                None,
+                start_time_ticks,
+                &comm,
+                raw.monotonic_ns,
+            ) else {
+                return BuildOutcome::Rejected(RejectReason::OutOfScope);
+            };
+            let success = *result == 0;
+            let errno = if success {
+                None
+            } else {
+                result
+                    .checked_neg()
+                    .and_then(|value| i32::try_from(value).ok())
+            };
+            BuildOutcome::Included(vec![Event {
+                id: None,
+                session_id: session_id.to_owned(),
+                schema_version: SCHEMA_VERSION,
+                event_type: EventType::NetworkConnect,
+                timestamp_ns,
+                monotonic_ns: raw.monotonic_ns,
+                pid: tracked.tgid,
+                tid: raw.pid,
+                uid: info.as_ref().map(|value| value.uid).unwrap_or(raw.uid),
+                gid: info.as_ref().map(|value| value.gid).unwrap_or(raw.gid),
+                ppid: tracked.ppid.or(ppid),
+                comm: tracked.comm.clone(),
+                process_instance_id: tracked.process_instance_id.clone(),
+                payload: EventPayload::NetworkConnect {
+                    family: *family,
+                    source_address: source_address.clone(),
+                    source_port: *source_port,
+                    destination_address: destination_address.clone(),
+                    destination_port: *destination_port,
+                    result: *result,
+                    success,
+                    errno,
+                    established: false,
+                },
+                provenance: Some(event_provenance(raw, "syscall_pair_attributed")),
+            }])
         }
     }
 }
@@ -1062,6 +1379,25 @@ fn flush_buffered_fork(
             child_comm: tracked.comm.clone(),
             child_start_time_ticks: tracked.start_time_ticks,
         },
+        provenance: Some(syscall_core::EventProvenance {
+            raw_bpf_pid: tracked.raw_tgid.or(Some(tracked.tgid)),
+            raw_bpf_tgid: tracked.raw_tgid.or(Some(tracked.tgid)),
+            observer_pid: if tracked.provisional {
+                None
+            } else {
+                Some(tracked.tgid)
+            },
+            observer_tgid: if tracked.provisional {
+                None
+            } else {
+                Some(tracked.tgid)
+            },
+            source_tracepoint: Some("sched/sched_process_fork".to_owned()),
+            wire_schema_version: Some(2),
+            attribution_method: Some("fork_buffered_then_correlated".to_owned()),
+            timestamp_clock_domain: Some("wall_realtime_derived".to_owned()),
+            monotonic_clock_domain: Some("monotonic_boot_raw".to_owned()),
+        }),
     }
 }
 
@@ -1108,6 +1444,24 @@ fn flush_unresolved_fork(
             child_comm: tracked.comm.clone(),
             child_start_time_ticks: tracked.start_time_ticks,
         },
+        provenance: Some(syscall_core::EventProvenance {
+            raw_bpf_pid: Some(raw_tgid),
+            raw_bpf_tgid: Some(raw_tgid),
+            observer_pid: None,
+            observer_tgid: None,
+            source_tracepoint: Some("sched/sched_process_fork".to_owned()),
+            wire_schema_version: Some(2),
+            attribution_method: Some(
+                if tracked.provisional {
+                    "fork_unresolved_provisional"
+                } else {
+                    "fork_unresolved_raw"
+                }
+                .to_owned(),
+            ),
+            timestamp_clock_domain: Some("wall_realtime_derived".to_owned()),
+            monotonic_clock_domain: Some("monotonic_boot_raw".to_owned()),
+        }),
     })
 }
 
@@ -1273,8 +1627,9 @@ impl Drop for SessionGuard<'_> {
         if self.finalized {
             return;
         }
+        let now = clock::realtime_now_ns().unwrap_or(0);
         let finish = SessionFinish {
-            ended_at_ns: clock::realtime_now_ns().unwrap_or(0),
+            ended_at_ns: now,
             status: SessionStatus::Failed,
             dropped_events: 0,
             ringbuf_lost_events: 0,
@@ -1282,6 +1637,20 @@ impl Drop for SessionGuard<'_> {
             malformed_events: 0,
             filtered_events: 0,
             error: Some("recording aborted before finalization".to_owned()),
+            termination_reason: Some("collector_abort".to_owned()),
+            target_exit_code: None,
+            target_exit_signal: None,
+            recovered_from_status: None,
+            recovered_at_ns: None,
+            finalized_at_ns: Some(now),
+            events_received: 0,
+            events_decoded: 0,
+            events_attributed: 0,
+            events_persisted: 0,
+            events_rejected_scope: 0,
+            events_rejected_malformed: 0,
+            events_persist_failed: 0,
+            events_self_filtered: 0,
         };
         if let Err(err) = self.storage.finish_session(&self.session_id, &finish) {
             tracing::error!(error = %err, "failed to finalize aborted session");
@@ -1453,6 +1822,36 @@ mod tests {
     }
 
     #[test]
+    fn identifies_collector_self_samples_by_any_pid_field() {
+        let mut raw = DecodedEvent {
+            event_type: EventType::ProcessExec,
+            monotonic_ns: 1,
+            pid: 4242,
+            tgid: 4242,
+            ns_tgid: 4242,
+            uid: 1000,
+            gid: 1000,
+            comm: "syscall".to_owned(),
+            payload: DecodedPayload::Exec {
+                old_pid: 0,
+                filename: "/bin/true".to_owned(),
+            },
+            wire_schema_version: 3,
+        };
+        assert!(is_collector_self(&raw, 4242));
+
+        raw.pid = 5000;
+        assert!(is_collector_self(&raw, 4242), "raw tgid still matches");
+
+        raw.tgid = 5001;
+        assert!(is_collector_self(&raw, 4242), "ns_tgid still matches");
+
+        raw.ns_tgid = 5002;
+        assert!(!is_collector_self(&raw, 4242));
+        assert!(is_collector_self(&raw, 5002));
+    }
+
+    #[test]
     fn normalizes_comm_to_kernel_limit() {
         assert_eq!(normalize_comm("", None), "unknown");
         assert_eq!(normalize_comm("", Some("fallback")), "fallback");
@@ -1478,6 +1877,7 @@ mod tests {
                 old_pid: 1,
                 filename: "/usr/bin/test".to_owned(),
             },
+            wire_schema_version: 2,
         };
         let BuildOutcome::Included(mut events) = build_event(
             &raw,
@@ -1510,6 +1910,7 @@ mod tests {
             gid: 1000,
             comm: "thread".to_owned(),
             payload: DecodedPayload::Exit { exit_priority: 120 },
+            wire_schema_version: 2,
         };
         let mut scope = ScopeTracker::new(RecordingScope::System, "boot");
         assert!(matches!(
@@ -1539,6 +1940,7 @@ mod tests {
                 old_pid: 61527,
                 filename: "/bin/sh".to_owned(),
             },
+            wire_schema_version: 2,
         };
         let BuildOutcome::Included(mut events) =
             build_event(&raw, &mut scope, &mut HashMap::new(), "s-test", "boot", 0)
@@ -1576,6 +1978,7 @@ mod tests {
                 old_pid: 61527,
                 filename: "/bin/sh".to_owned(),
             },
+            wire_schema_version: 2,
         };
         let mut buf = HashMap::new();
         assert!(matches!(
@@ -1598,6 +2001,7 @@ mod tests {
                 parent_comm: "sh".to_owned(),
                 child_comm: "sleep".to_owned(),
             },
+            wire_schema_version: 2,
         };
         let BuildOutcome::Included(events) =
             build_event(&fork, &mut scope, &mut buf, "s", "boot", 0)
@@ -1623,6 +2027,7 @@ mod tests {
                 old_pid: 64570,
                 filename: "/bin/sleep".to_owned(),
             },
+            wire_schema_version: 2,
         };
         let BuildOutcome::Included(events) =
             build_event(&child_exec, &mut scope, &mut buf, "s", "boot", 0)
@@ -1658,6 +2063,7 @@ mod tests {
                 parent_comm: "sh".to_owned(),
                 child_comm: "true".to_owned(),
             },
+            wire_schema_version: 2,
         };
         let BuildOutcome::Included(e) = build_event(&fork, &mut scope, &mut buf, "s", "boot", 0)
         else {
@@ -1677,6 +2083,7 @@ mod tests {
                 old_pid: 64570,
                 filename: "/bin/true".to_owned(),
             },
+            wire_schema_version: 2,
         };
         let BuildOutcome::Included(events) =
             build_event(&exec, &mut scope, &mut buf, "s", "boot", 0)
@@ -1696,6 +2103,7 @@ mod tests {
             gid: 1000,
             comm: "true".to_owned(),
             payload: DecodedPayload::Exit { exit_priority: 0 },
+            wire_schema_version: 2,
         };
         let BuildOutcome::Included(events) =
             build_event(&exit, &mut scope, &mut buf, "s", "boot", 0)
@@ -1706,5 +2114,132 @@ mod tests {
         assert_eq!(events[0].event_type, EventType::ProcessExit);
         assert_eq!(events[0].pid, 51222);
         assert_eq!(events[0].process_instance_id, iid);
+    }
+    #[test]
+    fn file_activity_is_attributed_in_system_scope() {
+        let pid = std::process::id() as i32;
+        let info = procfs::read(pid).unwrap();
+        let mut scope = ScopeTracker::new(RecordingScope::System, "boot");
+        let raw = DecodedEvent {
+            event_type: EventType::FileOpen,
+            monotonic_ns: 2000,
+            pid,
+            tgid: pid,
+            ns_tgid: 0,
+            uid: info.uid,
+            gid: info.gid,
+            comm: info.comm.clone(),
+            payload: DecodedPayload::FileOpen {
+                path: "/etc/hosts".to_owned(),
+                path_is_absolute: true,
+                path_truncated: false,
+                dirfd: -100,
+                flags: 0,
+                result: 4,
+            },
+            wire_schema_version: 3,
+        };
+        let BuildOutcome::Included(events) = build_event(
+            &raw,
+            &mut scope,
+            &mut HashMap::new(),
+            "s-activity",
+            "boot",
+            0,
+        ) else {
+            panic!("expected file activity to be included");
+        };
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.event_type, EventType::FileOpen);
+        assert_eq!(event.pid, pid);
+        assert_eq!(
+            event
+                .provenance
+                .as_ref()
+                .unwrap()
+                .source_tracepoint
+                .as_deref(),
+            Some("syscalls/sys_exit_openat")
+        );
+        let EventPayload::FileOpen {
+            path,
+            result,
+            success,
+            errno,
+            ..
+        } = &event.payload
+        else {
+            panic!("expected file payload");
+        };
+        assert_eq!(path, "/etc/hosts");
+        assert_eq!(*result, 4);
+        assert!(*success);
+        assert_eq!(*errno, None);
+    }
+
+    #[test]
+    fn network_activity_respects_target_tree_scope() {
+        let pid = std::process::id() as i32;
+        let info = procfs::read(pid).unwrap();
+        let mut scope = ScopeTracker::new(RecordingScope::TargetTree, "boot");
+        scope.register_root(pid, Some(info.ppid), info.start_time_ticks, &info.comm, 1);
+        let mut raw = DecodedEvent {
+            event_type: EventType::NetworkConnect,
+            monotonic_ns: 3000,
+            pid,
+            tgid: pid,
+            ns_tgid: 0,
+            uid: info.uid,
+            gid: info.gid,
+            comm: info.comm.clone(),
+            payload: DecodedPayload::NetworkConnect {
+                family: syscall_core::AddressFamily::Ipv4,
+                source_address: None,
+                source_port: None,
+                destination_address: "192.0.2.1".to_owned(),
+                destination_port: 443,
+                result: -111,
+            },
+            wire_schema_version: 3,
+        };
+        let BuildOutcome::Included(events) = build_event(
+            &raw,
+            &mut scope,
+            &mut HashMap::new(),
+            "s-activity",
+            "boot",
+            0,
+        ) else {
+            panic!("expected root network activity to be included");
+        };
+        let EventPayload::NetworkConnect {
+            result,
+            success,
+            errno,
+            established,
+            ..
+        } = &events[0].payload
+        else {
+            panic!("expected network payload");
+        };
+        assert_eq!(*result, -111);
+        assert!(!*success);
+        assert_eq!(*errno, Some(111));
+        assert!(!*established);
+
+        raw.pid = 999_999;
+        raw.tgid = 999_999;
+        assert!(matches!(
+            build_event(
+                &raw,
+                &mut scope,
+                &mut HashMap::new(),
+                "s-activity",
+                "boot",
+                0,
+            ),
+            BuildOutcome::Rejected(RejectReason::OutOfScope)
+        ));
     }
 }
