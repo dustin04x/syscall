@@ -896,12 +896,12 @@
 
 .pg-node:hover rect {
   stroke: var(--text-3);
-  fill: #191d1a;
+  fill: var(--surface-2);
 }
 
 .pg-node.selected rect {
   stroke: var(--accent);
-  fill: #181c13;
+  fill: var(--accent-dim);
 }
 
 .pg-node.in-path rect {
