@@ -57,7 +57,14 @@ jobs:
         run: npm ci --prefix ui
 
       - name: Run repository quality gate
+        # The BTF check targets the checked WSL2 kernel, not arbitrary runner kernels.
+        env:
+          SYSCALL_SKIP_BTF_LAYOUT: "1"
         run: scripts/check.sh
+
+      - name: Inspect runner kernel BTF layout
+        continue-on-error: true
+        run: scripts/check-btf-layout.sh
 
       - name: Build standalone UI
         run: npm run build --prefix ui

@@ -59,7 +59,11 @@ echo "== make -C ebpf clean check =="
 make -C ebpf clean check
 
 echo "== tracepoint context layout vs kernel BTF =="
-scripts/check-btf-layout.sh
+if [ "${SYSCALL_SKIP_BTF_LAYOUT:-0}" = "1" ]; then
+    echo "SKIP: SYSCALL_SKIP_BTF_LAYOUT=1 (kernel layout is environment-specific)"
+else
+    scripts/check-btf-layout.sh
+fi
 
 echo
 echo "All non-privileged checks passed."
