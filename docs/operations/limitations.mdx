@@ -1,0 +1,82 @@
+---
+title: "Known limitations"
+description: "Coverage, attribution, integrity, and operational limits that qualify every conclusion."
+---
+
+These limits are part of the product contract. Read them before using a session for a negative conclusion, a security decision, or an evidentiary claim.
+
+## Collection
+
+| Limitation | Consequence | Practical response |
+| --- | --- | --- |
+| Only `openat` and `connect` activity is captured | `open`, `openat2`, `sendto`, `sendmsg`, `accept`, writes, renames, and unlinks are invisible | Do not infer absence from a missing event |
+| Tracepoints are system-wide | Kernel produces host activity even in target-tree mode | Check `filtered_events`; treat scope as userspace admission |
+| Ring buffer and userspace channel are bounded | Busy hosts can lose events | Check `ringbuf_lost_events` and `userspace_dropped_events` |
+| Missing syscall enter/exit or LRU eviction | No activity event is emitted and it is not separately counted | Absence of an activity row is not proof of no attempt |
+| Detached descendants may outlive the target | Collection may stop before their later activity | Keep the target alive or use an explicit waiting wrapper |
+| Fixed tracepoint structs replace CO-RE | Kernel layout changes can require code and schema updates | Run `scripts/check-btf-layout.sh` before recording |
+| BTF must be readable for layout verification | Some hardened or minimal kernels cannot be checked | Do not load if the layout cannot be verified |
+| File paths are capped at 256 bytes | Long paths are truncated and marked | Treat a truncated path as incomplete evidence |
+
+## Identity and attribution
+
+| Limitation | Consequence | Practical response |
+| --- | --- | --- |
+| BPF and collector may see different PID namespaces | Raw IDs may not match observer IDs | Use canonical process identity and check unresolved flags |
+| Fork handler currently emits child `ns_tgid=0` | Canonical child identity may wait for a later exec or exit | Expect provisional forks; do not invent ancestry |
+| `/proc` reads race with process exit | Start time or metadata may be unavailable | Check for fallback identity markers |
+| Thread discrimination can race | A child may disappear before leader status is checked | Treat ambiguous identity as unresolved |
+| PID reuse is resolved by start time | Two processes with the same PID remain separate instances | Use process-instance IDs, not PIDs alone |
+| Parent linkage may be ambiguous | Tree edges can be missing or unresolved | Use `tree` notes and analysis limitations |
+| Tracked process table is capped at 65,536 | Excess processes are filtered and counted | Watch filtered counts on fork-heavy workloads |
+| Target-tree scope is not a security boundary | A hostile process cannot inject events but may influence attribution races | Do not treat scope as isolation |
+
+## Evidence semantics
+
+| Limitation | Consequence | Practical response |
+| --- | --- | --- |
+| An open is not a read | A `file_open` row proves only the attempt and result | Do not claim file contents were accessed |
+| A connect is not a session | Success means `connect` returned 0 | Never report an established connection or data transfer |
+| TCP and UDP are indistinguishable at this hook | Transport protocol is unknown | State that the protocol is not established |
+| Source address is often unavailable | Source fields may be null | Do not infer the local endpoint |
+| Relative paths are not resolved | Target file may differ from the string recorded | Use dirfd and context, and mark the limit |
+| Timestamps derive from a captured offset | NTP steps can skew wall time | Prefer monotonic timestamps for ordering |
+| Absence of an event is not proof of no activity | Loss and coverage gaps exist | Pair negative claims with collection accounting |
+| No file contents, payloads, DNS, or environment variables | Some investigative questions cannot be answered | Use host-level tooling for those questions |
+
+## Integrity and custody
+
+| Limitation | Consequence | Practical response |
+| --- | --- | --- |
+| No tamper-evident log or signature | A writer can modify the database | Hash and custody records are external controls |
+| Verification is not authenticity | `valid` means no observed contradictions | Do not equate validity with truth |
+| Export manifest is not a signature | It detects post-export changes only | Record who handled the package |
+| Analysis is not a verdict | Findings are deterministic indicators | Evaluate context, false positives, and limitations |
+| No audit log of recorder operators | The tool does not record who ran sudo | Use OS audit tooling |
+
+## Operations
+
+| Limitation | Consequence | Practical response |
+| --- | --- | --- |
+| Recording requires privilege | Unprivileged users cannot capture | Use sudo or scoped capabilities |
+| Root shell skips privilege drop | Target runs as root | Use sudo from an unprivileged account |
+| `--redact-args` covers arguments only | Paths and destinations remain | Treat evidence as sensitive |
+| Read-only open does not migrate | Older or newer schema may fail | Use a compatible database; record a new session |
+| Workbench has no record control | Recording is CLI-only | Record first, then open the database |
+| Workbench export path is fixed | No save dialog or frontend path | Use `SYSCALL_EXPORT_DIR` at startup if needed |
+| No signed installer or packaged bundle | Distribution is source-built | Build from a trusted checkout |
+| Large desktop sessions are paged, not fully virtualized | Some large views may be slower | Filter by time, process, or search |
+| No automated GUI end-to-end test | Visual regressions need manual checks | Run renderer and service tests plus a manual smoke test |
+| CI cannot prove privileged kernel capture | Green CI is not a live-capture PASS | Run the operator e2e on a capable host |
+
+## What "no findings" means
+
+A clean analysis or a `valid` verification does not prove that nothing happened.
+
+- Collection may have missed activity.
+- The relevant syscall may not be hooked.
+- The session may cover the wrong process tree or time range.
+- The rule set may not model the behavior.
+- A path or identity may be unresolved.
+
+Use [Verification](/guides/verify), [Analysis rules](/reference/analysis-rules), and the session's collection counters together. State the limits in the report.

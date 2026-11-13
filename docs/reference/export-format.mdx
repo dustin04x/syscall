@@ -1,0 +1,181 @@
+---
+title: "Export format"
+description: "Schema and integrity rules for the deterministic syscall-export/v2 JSON package."
+---
+
+`syscall export` produces a single JSON package. The current format is `syscall-export/v2`; the manifest schema is version `2`.
+
+The source database is opened read-only. The package is written atomically with mode `0600` and is never overwritten without explicit `--force`.
+
+## Top-level structure
+
+| Field | Contents |
+| --- | --- |
+| `export_format_version` | `syscall-export/v2` |
+| `metadata` | Export timestamp, source database path, session ID, version/build information, limitations |
+| `session` | Recorded session metadata and counters |
+| `process_instances` | Reconstructed process-instance evidence in stable order |
+| `events` | Recorded events in stable order |
+| `analysis` | `syscall-analysis/v1` report or explicit failure object |
+| `verification` | Embedded read-only verification report |
+| `manifest` | SHA-256 entries for evidence components |
+
+## Metadata
+
+`metadata` contains:
+
+- `export_timestamp_ns`: when the package was created.
+- `database_path`: the source path as provided.
+- `session_id`: the exported session.
+- `syscall_version` and `syscall_build` when available.
+- `limitations`: explicit package limitations.
+
+The export timestamp is the only normal source of variation between two exports of identical evidence.
+
+## Session and processes
+
+`session` preserves recorded metadata and counters, including redacted arguments when redaction was used. Unrelated sessions are excluded.
+
+`process_instances` is reconstructed from recorded events in stable order. It includes unresolved and provisional identity evidence rather than filling gaps.
+
+## Events
+
+`events` contains every recorded event for the requested session in:
+
+```text
+timestamp_ns ASC, monotonic_ns ASC, id ASC
+```
+
+File-open and network-connect events are included through the generic event representation. Legacy rows with unavailable provenance serialize provenance as `null` and are noted in limitations.
+
+## Analysis component
+
+`analysis` carries the `syscall-analysis/v1` report:
+
+- Session summary.
+- Evidence completeness.
+- Evaluated rule metadata.
+- Findings and original event IDs.
+- Limitations.
+
+Export uses the default analysis configuration. If analysis cannot complete, the component remains present:
+
+```json
+{
+  "status": "analysis_failed",
+  "error": "...",
+  "findings": []
+}
+```
+
+An export limitation is recorded. The component is never silently omitted.
+
+## Verification component
+
+`verification` carries the read-only verification report. If verification cannot complete, the package preserves an explicit failure or unavailable outcome and records a limitation.
+
+For deterministic exports of identical evidence, `verification_timestamp_ns` is normalized to `0`. The actual export action time remains in `metadata.export_timestamp_ns`.
+
+## Determinism
+
+Evidence components are serialized with stable key ordering and stable ordering of processes and events. Analysis is deterministic for identical evidence and the default configuration.
+
+For identical recorded evidence:
+
+- `session`, `process_instances`, `events`, `analysis`, and `verification` should be byte-stable after canonical serialization.
+- `metadata.export_timestamp_ns` can change.
+- The embedded verification timestamp is normalized.
+
+Determinism does not prove authenticity.
+
+## Manifest
+
+The manifest contains:
+
+| Field | Meaning |
+| --- | --- |
+| `manifest_version` | `2` |
+| `hash_algorithm` | `sha256` |
+| `entries` | One entry per evidence component |
+| `note` | Integrity semantics |
+
+Each entry contains:
+
+| Field | Meaning |
+| --- | --- |
+| `component` | `analysis`, `events`, `metadata`, `process_instances`, `session`, or `verification` |
+| `version` | Component format version, or `syscall-analysis/v1` |
+| `sha256` | Lowercase hex digest |
+| `byte_length` | Length of the hashed bytes |
+
+The manifest is not hashed into itself.
+
+### Hashing method
+
+For each component:
+
+```text
+sha256(serde_json::to_string_pretty(component) + "\n")
+```
+
+The bytes are UTF-8. Consumers must serialize the exact component value the same way to reproduce the digest.
+
+## Verification
+
+```bash
+syscall verify-export <PACKAGE>
+```
+
+The verifier checks:
+
+- Package format and manifest version.
+- Duplicate or missing component entries.
+- Byte lengths.
+- SHA-256 hashes.
+
+Exit codes:
+
+| Exit | Meaning |
+| ---: | --- |
+| `0` | Valid |
+| `1` | Invalid |
+
+Legacy v1 packages containing a manifest self-entry are reported as warnings rather than silently accepted.
+
+## Integrity semantics
+
+<Warning>
+The manifest checks post-export integrity. It is not proof that the source database was authentic or untampered before export. It is not a digital signature, does not identify who created the package, and is not a chain of custody.
+</Warning>
+
+Verification of the session and verification of the export answer different questions:
+
+| Operation | Question |
+| --- | --- |
+| `syscall verify` | Is the stored session internally consistent where checked? |
+| `syscall verify-export` | Do the package components match the manifest? |
+
+Neither proves that the kernel observed every relevant event.
+
+## Privacy
+
+- Arguments are exported as recorded; redacted arguments remain redacted.
+- File paths can reveal sensitive names and directory structure.
+- Connect events reveal destination addresses and ports.
+- Source addresses may be null.
+- No file contents, packet payloads, DNS names, environment variables, or unrelated sessions are included.
+- Paths may be relative or truncated; connect events remain attempts.
+
+Treat packages as sensitive evidence.
+
+## Versioning
+
+| Contract | Current value |
+| --- | --- |
+| Package format | `syscall-export/v2` |
+| Manifest | `2` |
+| Analysis component | `syscall-analysis/v1` |
+
+v2 stopped hashing the manifest into itself and introduced manifest schema 2. Existing v1 packages remain inspectable. Future changes must increment the relevant version and document compatibility.
+
+See [Export evidence](/guides/export) for the command workflow.

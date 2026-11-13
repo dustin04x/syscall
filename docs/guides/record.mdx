@@ -1,0 +1,165 @@
+---
+title: "Record a session"
+description: "Run a target tree under real kernel capture, with explicit scope, privilege, and exit behavior."
+---
+
+`syscall record` loads the eBPF programs, attaches seven tracepoints, drops privilege, creates a session, and runs one target command.
+
+## Before recording
+
+1. Check the host with `syscall info`.
+2. Confirm the target and database paths are authorized and writable by the invoking user.
+3. Decide whether target arguments should be persisted.
+4. Choose `target-tree` unless host-wide activity is explicitly required.
+
+Recording requires effective UID 0, `CAP_BPF` + `CAP_PERFMON`, or `CAP_SYS_ADMIN` on older kernels. SYSCALL never invokes sudo or prompts for a password.
+
+```bash
+sudo target/release/syscall record -- /usr/bin/sleep 5
+```
+
+When started through sudo, the recorder loads and attaches as root, then becomes the invoking user before creating the database or spawning the target.
+
+## Command shape
+
+```bash
+syscall record [OPTIONS] -- <COMMAND> [ARGUMENTS...]
+```
+
+The `--` separator is required. Target flags are passed to the target, not parsed as recorder flags.
+
+```bash
+sudo syscall record -- /usr/bin/printf --json
+```
+
+The target is spawned directly, not through a shell. Use an explicit shell if shell syntax is required:
+
+```bash
+sudo syscall record -- /bin/sh -c 'cat /etc/hostname >/dev/null; sleep 1'
+```
+
+## Options
+
+| Option | Default | Effect |
+| --- | --- | --- |
+| `--scope target-tree` | Yes | Admit the launched target and descendants. |
+| `--scope system` | | Admit every observed event on the host. |
+| `--redact-args` | Off | Store `"<redacted>"` instead of the target's arguments. |
+| `--session-id ID` | Generated | Override the session identifier. |
+| `--db PATH` | User data directory | Select the SQLite database. |
+| `--json` | Off | Emit the final record report as JSON. |
+
+The database path can also be set with `SYSCALL_DB`.
+
+## Scope
+
+The kernel tracepoints are system-wide in both modes. Scope is userspace admission, not a kernel security boundary.
+
+| Scope | Admission |
+| --- | --- |
+| `target-tree` | The spawned target and descendants with verified lineage or tracked ancestry. |
+| `system` | Every event that reaches attribution. |
+
+Out-of-scope events are counted as filtered. They are not collection loss.
+
+<Warning>
+`--scope system` can collect unrelated host activity and produce a much larger database. Use it only when host-wide observation is intended and authorized.
+</Warning>
+
+## Redaction
+
+Target arguments are persisted by default:
+
+```bash
+sudo syscall record -- /usr/bin/curl --token=secret https://example.test
+```
+
+Redact them:
+
+```bash
+sudo syscall record --redact-args -- /usr/bin/curl --token=secret https://example.test
+```
+
+`--redact-args` replaces all arguments with `"<redacted>"`. The executable path is still stored. File paths and network destinations recorded by tracepoints are not redacted.
+
+## Session identity and database
+
+A generated session ID is time- and randomness-based. Use `--session-id` when an external workflow requires a stable identifier.
+
+The default database is `~/.local/share/syscall/syscall.db`. To keep an investigation isolated:
+
+```bash
+sudo syscall record \
+  --db /home/alice/evidence/incident-42.db \
+  -- /opt/tool/run
+```
+
+The directory must already exist and be writable by the invoking user. The recorder creates the database with mode `0600`; the data directory is expected to be mode `0700`.
+
+After sudo, the database, WAL sidecar, and target process are owned by the invoking user.
+
+## What happens during recording
+
+1. The request, scope, target, and session ID are validated.
+2. Privilege, BTF, tracefs, and `unprivileged_bpf_disabled` are inspected.
+3. The BPF skeleton is loaded and all seven programs are attached.
+4. Privilege is dropped to the invoking user.
+5. The session row is created.
+6. The target starts in its own process group.
+7. The root PID is registered with the scope tracker.
+8. Events are decoded, attributed, and written in batches.
+9. On exit or signal, the recorder drains, finalizes counters, and joins the writer.
+
+The session row exists before the target starts. A normal error marks it `failed`. A hard crash leaves it `recording`, but committed rows remain inspectable.
+
+## Signals and exit codes
+
+`record` mirrors the target when recording succeeds.
+
+| Outcome | Exit code |
+| --- | ---: |
+| Target exited normally | Target's exit code |
+| Target terminated by signal `N` | `128 + N` |
+| Recorder interrupted by SIGINT | `130` |
+| Recorder interrupted by SIGTERM | `143` |
+| Recording or finalization failed | `1` (or a documented error exit) |
+| No target outcome recorded | `0` |
+
+On SIGINT or SIGTERM, the recorder stops accepting work, sends SIGTERM to the target process group, waits up to two seconds, sends SIGKILL if needed, drains for up to 500 ms, and finalizes the session as `interrupted`.
+
+## Detached descendants
+
+The recorder follows the launched target tree while the target is alive. Descendants that detach and outlive the target are not followed after finalization. If long-running background processes are part of the investigation, keep the target alive for the required duration or record with an explicit wrapper that waits for them.
+
+## Failure behavior
+
+| Failure | Result |
+| --- | --- |
+| Insufficient privilege | Explicit refusal; no partial session |
+| BPF load or attach failure | Phase error; no recording |
+| Database open or write failure | Session failure; committed rows remain |
+| Target cannot be spawned | Session failure with the spawn error |
+| Userspace queue full | Drop is counted; recording continues |
+| Ring-buffer loss | Kernel counter is persisted at finalization |
+| Malformed sample | Counted and discarded; recording continues |
+| Ctrl+C | Session finalized as `interrupted` |
+
+Do not treat a `failed` or `recording` session as a clean capture. Inspect its counters before using it.
+
+## Confirm the result
+
+```bash
+syscall sessions
+syscall inspect <SESSION_ID>
+syscall stats <SESSION_ID>
+```
+
+Check:
+
+- Status and termination reason.
+- Persisted event count versus received, decoded, and attributed counts.
+- Ring-buffer loss, userspace drops, malformed samples, and persistence failures.
+- Filtered events if target-tree scope was used.
+- Unresolved identity or ancestry.
+
+Then proceed to [Investigate a session](/guides/investigate).

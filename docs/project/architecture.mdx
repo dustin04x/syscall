@@ -1,0 +1,200 @@
+---
+title: "Architecture"
+description: "Crate boundaries, kernel surface, storage concurrency, desktop IPC, and the design tradeoffs behind SYSCALL."
+---
+
+SYSCALL separates five concerns:
+
+1. A small, verifiable kernel collection surface.
+2. Strict decoding of untrusted kernel samples.
+3. Explicit userspace attribution.
+4. Durable, inspectable storage with bounded memory.
+5. Read-only investigation surfaces that share one evidence model.
+
+## Workspace layout
+
+| Crate | Responsibility |
+| --- | --- |
+| `syscall-core` | Domain model, schema versions, validation, identity IDs, clocks, paths, scope vocabulary |
+| `syscall-storage` | SQLite schema, migrations, sessions, batched inserts, read-only queries, verification |
+| `syscall-collector` | BPF skeleton, tracepoint programs, decoder, scope attribution, procfs, writer, signals, orchestration |
+| `syscall-analysis` | Bounded read-only evidence context, deterministic rules, strict configuration, report assembly |
+| `syscall-export` | Deterministic JSON package and SHA-256 manifest |
+| `syscall-cli` | Argument parsing, text and JSON rendering, exit-code policy |
+| `syscall-desktop` | Tauri commands, read-only application service, DTO contract |
+| `desktop/` | React 19 renderer, routes, feature screens, design system |
+| `ui/` | Standalone interface renderer using deterministic preview data |
+
+`syscall-core` has no eBPF or SQLite dependency. `syscall-storage` has no eBPF dependency. This keeps the event contract and database independently testable.
+
+## Kernel surface
+
+`ebpf/syscall.bpf.c` attaches to seven stable tracepoints:
+
+| Group | Tracepoints |
+| --- | --- |
+| Lifecycle | `sched_process_exec`, `sched_process_fork`, `sched_process_exit` |
+| Filesystem | `sys_enter_openat`, `sys_exit_openat` |
+| Network | `sys_enter_connect`, `sys_exit_connect` |
+
+Syscall hooks pair enter and exit in bounded LRU hash maps keyed by the current task. Each map holds 8,192 entries. Enter stores arguments; exit looks up and removes them. A missing enter or eviction produces no event.
+
+Samples are emitted only at exit and carry the raw return value. This makes attempt-versus-success explicit. The hook does not resolve paths, perform DNS, or inspect payloads.
+
+The programs use fixed local structs instead of `vmlinux.h` and CO-RE. Context layouts are protected by `_Static_assert` and checked against the running kernel BTF:
+
+| Tracepoint context | Size | Verified members |
+| --- | ---: | --- |
+| `trace_event_raw_sched_process_exec` | 20 | `ent@0`, `__data_loc_filename@8`, `pid@12`, `old_pid@16` |
+| `trace_event_raw_sched_process_fork` | 48 | `ent@0`, `parent_comm@8`, `parent_pid@24`, `child_comm@28`, `child_pid@44` |
+| `trace_event_raw_sched_process_template` | 32 | `ent@0`, `comm@8`, `pid@24`, `prio@28` |
+
+The sizes are bytes; the BTF helper reports bit offsets.
+
+The programs write to a 4 MiB ring buffer. A one-entry array map accumulates output failures so userspace can persist a real loss counter. Pairing-map eviction is not separately counted; that gap is documented.
+
+The eBPF side performs no filtering and no heap allocation. The file-open event is ring-buffer reserved because its 336-byte event plus 272-byte pairing arguments exceed the 512-byte BPF stack limit.
+
+The exec filename is a `__data_loc` string. The low 16 bits are an offset from the tracepoint context. `bpf_probe_read_kernel_str` copies it with a 256-byte bound and records the actual length.
+
+## Wire format
+
+The header is 56 bytes. Sample sizes:
+
+| Sample | Bytes |
+| --- | ---: |
+| Exec | 320 |
+| Fork | 96 |
+| Exit | 64 |
+| File-open | 336 |
+| Network-connect | 104 |
+
+Wire v3 adds the activity types. Process samples from v1 and v2 remain decodable; activity types require v3.
+
+The decoder checks magic, schema, type, minimum size, payload length, payload end bounds, NUL termination, address family, address length, and padding. Malformed samples are counted and discarded.
+
+See [Event and storage schema](/reference/schemas) for every offset.
+
+## Recording orchestration
+
+`syscall_collector::record` runs in phases:
+
+1. Validate the request, scope, target, and session ID.
+2. Inspect effective privilege, `unprivileged_bpf_disabled`, BTF, and tracefs.
+3. Load and attach the skeleton.
+4. Drop privileges when launched through sudo.
+5. Create the session as the invoking user.
+6. Spawn the target in its own process group.
+7. Register the root PID with the scope tracker.
+8. Poll the ring buffer, decode, attribute, and enqueue.
+9. Stop, drain, read counters, join the writer, and finalize.
+
+A `Drop` guard marks unfinished sessions `failed` on ordinary unwinds. A hard crash leaves the row `recording`; committed evidence remains readable.
+
+Scope and process identity are detailed in [Identity and scope](/concepts/identity-and-scope).
+
+## Storage and concurrency
+
+SQLite is opened with WAL, `synchronous=NORMAL`, foreign keys on, a 5-second busy timeout, and `trusted_schema=OFF`.
+
+The ring-buffer callback never performs disk I/O. It uses `try_send` on a bounded channel of 8,192 events. A full channel increments the userspace-drop counter.
+
+A dedicated writer thread owns its own SQLite connection and batches up to 256 events or 200 ms. Each batch commits in one transaction. If a later batch fails, the writer reports the committed count and error separately.
+
+Inspection opens read-only and verifies `PRAGMA user_version`. Queries use bound parameters and indexes for session/time, type, PID, process instance, and timestamp.
+
+## Failure handling
+
+| Failure | Behavior |
+| --- | --- |
+| No BPF privilege | Explicit `InsufficientPrivilege`; no partial session |
+| Skeleton load or attach failure | Explicit phase error |
+| Bad ring sample | Counted malformed; session continues |
+| Filtered scope | Counted filtered; session continues |
+| Channel full | Counted userspace drop; session continues |
+| Ring output failure | eBPF counter read at finalization |
+| Writer/SQLite failure | Session `failed`; committed rows remain |
+| Target exits | 750 ms drain, then finalize |
+| SIGINT/SIGTERM | Signal target group, grace period, drain, finalize |
+| Recorder unwind | Guard marks session `failed` |
+| Hard crash | Session remains `recording` and readable |
+| PID reuse | Distinct process instance; no inherited trust |
+| Missing syscall pair | No activity event; not separately counted |
+
+## Analysis boundary
+
+Analysis is offline. `syscall-analysis` reads persisted evidence through bounded storage APIs and emits versioned findings whose supporting events are original row IDs.
+
+The collector does not run rules in the hot path. The analysis crate has no eBPF or collector dependency. Queries are read-only; analysis never migrates, updates, or executes recorded commands.
+
+Event scans are bounded by `max_events`; findings by `max_findings`. Shell traversal, process-tree correlation, and per-finding support are independently capped.
+
+The result model lives in `syscall-core`. CLI rendering and export assembly consume it. The desktop service calls the same engine.
+
+## Export boundary
+
+`syscall-export` assembles session, process, event, analysis, and verification components with a SHA-256 manifest. Both the CLI and desktop use this crate.
+
+The source database is read-only. The package is written atomically. Export and verification semantics are documented in [Export format](/reference/export-format).
+
+## Desktop boundary
+
+```text
+React 19 + TypeScript renderer
+  │ feature screens, design system, hash router
+  │
+  └── src/lib/api.ts                 only Tauri API import
+          │ typed invoke(command, { request })
+          ▼
+      Tauri 2 IPC                    core:default capability; CSP
+          │
+      commands.rs                    typed async commands; blocking worker
+          │
+      service.rs                     validation, fixed paths, DTO mapping
+          │
+      ├── syscall-storage            read-only SQLite
+      ├── syscall-analysis           existing rules
+      ├── syscall-export             existing export and manifest
+      └── syscall-core               shared types
+```
+
+DTOs are defined once in `desktop/src-tauri/src/contract.rs` and mirrored in `desktop/src/types/contracts.ts`. Backend DTO fields are camelCase. Existing analysis and verification reports remain snake_case because they are reused verbatim.
+
+The renderer uses hash routes:
+
+```text
+#/overview
+#/sessions
+#/sessions/<session-id>/summary
+#/sessions/<session-id>/timeline?event=<event-id>
+#/sessions/<session-id>/processes?process=<process-instance-id>
+```
+
+The service contains no SQL. The frontend cannot choose a database or export path.
+
+## Tradeoffs
+
+- Fixed tracepoint structs are less portable than CO-RE, but every field is checked by BTF and static assertions.
+- Userspace target-tree attribution is transparent and simple, but the kernel still produces system-wide samples.
+- One writer thread and one read-only connection per command keep the design small; there is no multi-reader aggregation layer.
+- Activity is sampled at syscall exit. This is portable but cannot prove data access, transport protocol, or connection establishment.
+- Only `openat` and `connect` are captured.
+- The wall-clock offset is captured once, favoring internal consistency over responding to clock steps.
+- The desktop is read-only by design because a GUI record button would require root, cached credentials, or a new privileged helper.
+
+## Continue reading
+
+<CardGroup cols={2}>
+  <Card title="Development" icon="code" href="/project/development">
+    Build, test, BTF checks, privileged e2e, and change procedures.
+  </Card>
+  <Card title="Testing" icon="flask-conical" href="/project/testing">
+    What is verified, what CI covers, and what remains operator-run.
+  </Card>
+  <Card title="Schemas" icon="braces" href="/reference/schemas">
+    Wire and storage contracts.
+  </Card>
+  <Card title="Roadmap" icon="map" href="/project/roadmap">
+    Delivered phases and open work.
+  </Card>
+</CardGroup>

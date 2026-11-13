@@ -1,0 +1,146 @@
+---
+title: "WSL2 compatibility"
+description: "Observed WSL2 behavior, privileged validation results, and reproduction steps."
+---
+
+Audit date: **2026-11-10** (UTC)  
+Host: WSL2 on Windows  
+Distribution: Ubuntu 24.04.4 LTS  
+Kernel: `6.6.87.2-microsoft-standard-WSL2` (x86_64)
+
+This page records observed results. Capabilities that could not be exercised without root are marked **BLOCKED**, not PASS.
+
+## Environment
+
+| Item | Observed | Status |
+| --- | --- | --- |
+| WSL detection | Microsoft kernel marker in `/proc/version` | Pass |
+| Kernel | `6.6.87.2-microsoft-standard-WSL2` | Pass |
+| Rust / Cargo | `1.99.1` | Pass |
+| clang | Ubuntu clang 18.1.3 | Pass |
+| BTF | `/sys/kernel/btf/vmlinux` readable | Pass |
+| tracefs mount | `/sys/kernel/tracing` exists | Pass |
+| tracefs permissions | `drwx------ root root` | Root-only |
+| BTF tracepoint layouts | exec 20, fork 48, exit 32 | Pass |
+| `unprivileged_bpf_disabled` | `2` | Unprivileged BPF blocked |
+| `perf_event_paranoid` | `2` | Informational |
+| `bpftool` | Not installed | Not required |
+| libbpf | 1.3.0 system library | Pass |
+
+Unprivileged audit:
+
+```bash
+./scripts/env-audit.sh
+```
+
+Representative output:
+
+```text
+== Kernel interfaces ==
+BTF /sys/kernel/btf/vmlinux                  PASS (readable)
+tracefs mount                                PASS (/sys/kernel/tracing)
+tracefs permissions                          drwx------ 6 root root
+tracepoint sched_process_exec                BLOCKED (tracefs not readable without root)
+tracepoint sched_process_fork                BLOCKED (tracefs not readable without root)
+tracepoint sched_process_exit                BLOCKED (tracefs not readable without root)
+unprivileged_bpf_disabled                    2
+
+== Privilege ==
+CapEff                                       0000000000000000
+BPF load/attach                              BLOCKED (requires privilege)
+sudo                                         NOT TESTED (this script never invokes sudo)
+```
+
+A BLOCKED result from the unprivileged audit is the correct result. It is not evidence that kernel capture is broken.
+
+## Capability matrix
+
+| Capability | Result | Evidence |
+| --- | --- | --- |
+| Workspace build | Pass | Cargo check |
+| Formatting and lints | Pass | `fmt` and Clippy with warnings denied |
+| Unit and integration tests | Pass | Workspace suite |
+| eBPF object compile | Pass | Seven tracepoint sections |
+| Skeleton generation | Pass | `libbpf-cargo` output |
+| Tracepoint ABI vs BTF | Pass | Layout check |
+| `info` as user | Pass | Reports BTF, tracefs, and missing capability |
+| Unprivileged `record` refusal | Pass | Explicit insufficient-privilege error |
+| SQLite inspection | Pass | Storage tests and seeded fixtures |
+| BPF load | Pass | Privileged run |
+| Tracepoint attach | Pass | All seven programs attached |
+| Lifecycle capture | Pass | Exec, fork, and exit rows persisted |
+| File-open capture | Pass | 64 `file_open` rows in the first Phase 5 run |
+| IPv4/IPv6 connect capture | Pass | `127.0.0.1:1` and `::1:1`, both `-111` |
+| Ring-buffer events | Pass | `ringbuf_lost=0` in validated sessions |
+| Ctrl+C behavior | Pass | Exit `130`, session `interrupted` |
+| User-owned database after sudo | Pass | UID 1000, mode 600, directory mode 700 |
+| End-to-end verdict | Pass | `scripts/e2e-root.sh` |
+
+## Privileged validation
+
+Validated with an operator-authenticated sudo session on 2026-11-10.
+
+- `sudo scripts/e2e-root.sh` returned **E2E PASS**.
+- All seven tracepoints attached.
+- The lifecycle session completed and remained inspectable as the invoking user.
+- SIGINT exited `130` and finalized the session as `interrupted`.
+- The database was owned by the invoking user with mode `600`.
+- Phase 5 run one: 72 events, including 64 file opens and one IPv4 connect.
+- Phase 5 run two: 315 events, including IPv4 `127.0.0.1:1` and IPv6 `::1:1`.
+- Both sessions verified `valid` with zero findings.
+- `/etc/hostname` opened successfully.
+- `ringbuf_lost` was zero in the validated sessions.
+
+Two defects were found and fixed during validation:
+
+- Collector `/proc` enrichment generated recursive `openat` events. Self-originated samples are now filtered before enrichment.
+- The session lock directory was created as root before the privilege drop, causing the writer to fail. The lock is now acquired after the drop and is user-owned.
+
+## Reproduce the validation
+
+```bash
+cargo build -p syscall-cli
+sudo scripts/e2e-root.sh
+```
+
+Phase 5 manual capture:
+
+```bash
+sudo target/debug/syscall record --db /tmp/syscall-phase5.db -- \
+  /bin/bash -c 'cat /etc/hostname >/dev/null; (exec 3<>/dev/tcp/127.0.0.1/1) || true'
+
+SID=$(target/debug/syscall --db /tmp/syscall-phase5.db sessions --json \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["id"])')
+
+target/debug/syscall --db /tmp/syscall-phase5.db files "$SID"
+target/debug/syscall --db /tmp/syscall-phase5.db connections "$SID"
+target/debug/syscall --db /tmp/syscall-phase5.db verify "$SID"
+```
+
+If no activity rows appear, capture the exact error and treat live capture as unproven.
+
+## WSL2 notes
+
+- WSL2 exposes a real Linux kernel and real tracepoints. This is not emulated eBPF.
+- `unprivileged_bpf_disabled=2` is host hardening, not a SYSCALL defect.
+- Tracefs being root-only is normal. Use sudo or scoped capabilities.
+- Do not weaken `unprivileged_bpf_disabled` or tracefs permissions to make a test pass.
+- If attach fails after a successful load, preserve the exact libbpf error.
+- The Phase 5 syscall tracepoints exist in the 6.6 WSL2 ABI and attached under root.
+- WSL2 localhost networking may refuse an unused port. A refused connect is still valid evidence.
+- If the workbench window is blank under WSLg:
+
+```bash
+WEBKIT_DISABLE_COMPOSITING_MODE=1 target/release/syscall-workbench --db=...
+```
+
+WSLg used software compositing during validation; GPU acceleration and accessibility-bus integration were unavailable.
+
+## What remains unproven
+
+- A native Linux host run, beyond WSL2.
+- Stress and sustained-loss behavior.
+- Crash injection leaving a permanent `recording` session.
+- A privileged CI lane with explicit provisioning.
+
+See [Testing](/project/testing) and [Roadmap](/project/roadmap).

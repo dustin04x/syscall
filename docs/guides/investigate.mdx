@@ -1,0 +1,186 @@
+---
+title: "Investigate a session"
+description: "Move from a recorded session to process relationships, chronological activity, and filtered filesystem or network evidence."
+---
+
+Investigation commands read a persisted SQLite database. They do not attach eBPF, execute recorded commands, or modify the source database.
+
+All commands accept the global `--db PATH` and `--json` options. `--json` changes the output format, not the evidence selection.
+
+## Start with the session
+
+```bash
+syscall sessions
+syscall inspect <SESSION_ID>
+```
+
+`sessions` lists sessions newest first, with status, scope, time, event count, and duration. `inspect` adds:
+
+- Session ID, command, arguments as recorded, scope, status, and termination state.
+- Kernel and collector provenance.
+- Event counts by type.
+- Collection and loss counters.
+- Observed process summaries.
+- The database path in use.
+
+Read the counters before reading the conclusions. A small event count can mean a short session, a narrow scope, or collection loss.
+
+## Find a session
+
+List more than the default 50:
+
+```bash
+syscall sessions --limit 200
+```
+
+Use JSON for scripts:
+
+```bash
+syscall sessions --json
+```
+
+Select a different database:
+
+```bash
+syscall --db /evidence/incident-42.db sessions
+syscall --db /evidence/incident-42.db inspect <SESSION_ID>
+```
+
+## Reconstruct process relationships
+
+```bash
+syscall processes <SESSION_ID>
+syscall tree <SESSION_ID>
+```
+
+`processes` lists process instances derived from recorded events. Depending on the evidence, each row may include:
+
+- Canonical process-instance ID.
+- Canonical PID.
+- Recorded executable and command line.
+- Parent PID and parent instance when linkage is unambiguous.
+- First and last observed times.
+- Event count and whether an exit was observed.
+- Unresolved identity or ancestry flags.
+
+`tree` renders the hierarchy. It uses process-instance identity, not PID alone. Ambiguous PID-reuse matches are left unresolved, missing parents are marked, and cycles are reported rather than followed forever.
+
+```bash
+syscall tree <SESSION_ID>
+syscall --json tree <SESSION_ID>
+```
+
+## Read the event stream
+
+`events` is the raw chronological event listing:
+
+```bash
+syscall events <SESSION_ID>
+syscall events <SESSION_ID> --limit 50 --offset 100
+syscall events <SESSION_ID> --type process_exec
+syscall events <SESSION_ID> --pid 1234
+```
+
+`timeline` is the investigation-oriented view. It supports more filters and a stable, paged order:
+
+```bash
+syscall timeline <SESSION_ID>
+syscall timeline <SESSION_ID> --type file_open --limit 100
+syscall timeline <SESSION_ID> --pid 1234
+syscall timeline <SESSION_ID> --process-instance 'boot:1234:5678'
+syscall timeline <SESSION_ID> \
+  --from 2026-11-10T12:00:00Z \
+  --to 2026-11-10T12:05:00Z
+```
+
+Timeline filters:
+
+| Option | Meaning |
+| --- | --- |
+| `--type TYPE` | One event type |
+| `--pid PID` | Canonical recorded PID |
+| `--process-instance ID` | Exact process-instance ID |
+| `--from TIME` | Inclusive lower bound |
+| `--to TIME` | Inclusive upper bound |
+| `--limit N` | Page size, default 200 |
+| `--offset N` | Rows to skip |
+
+Accepted time forms:
+
+- Integer nanoseconds since the Unix epoch.
+- RFC3339 UTC such as `2026-11-10T12:34:56Z` or with fractional seconds.
+
+Ordering is deterministic: `timestamp_ns ASC, monotonic_ns ASC, id ASC`.
+
+## Follow filesystem attempts
+
+```bash
+syscall files <SESSION_ID>
+syscall files <SESSION_ID> --pid 1234
+syscall files <SESSION_ID> --result failure
+syscall files <SESSION_ID> --from 2026-11-10T12:00:00Z --json
+```
+
+Fields include event ID, UTC time, process identity, command name, raw path, flags, `dirfd`, raw result, success or errno, and notes for relative or truncated paths.
+
+Important interpretation:
+
+- The path is the string passed to `openat`, not a resolved absolute path.
+- `dirfd == -100` means `AT_FDCWD`; other values identify a directory descriptor.
+- Relative paths are preserved as recorded and cannot be resolved without the process working directory and descriptor state.
+- Truncated paths are marked.
+- An open attempt does not prove that file contents were read or written.
+- `open`, `openat2`, and other file syscalls are not captured.
+
+## Follow network attempts
+
+```bash
+syscall connections <SESSION_ID>
+syscall connections <SESSION_ID> --family ipv4
+syscall connections <SESSION_ID> --family ipv6 --result failure
+```
+
+Fields include event ID, UTC time, process identity, family, source and destination addresses and ports when available, raw result, and outcome or errno.
+
+Important interpretation:
+
+- A `connect` event is an attempt, not an established session.
+- The tracepoint cannot distinguish TCP from UDP.
+- Source metadata is often unavailable and is stored as `null`.
+- A successful local connection still does not prove application-level establishment or data transfer.
+
+## Summarize evidence accounting
+
+```bash
+syscall stats <SESSION_ID>
+syscall stats <SESSION_ID> --verify
+```
+
+`stats` reports duration, process-instance count, event counts by type, collection counters, kernel ring-buffer loss, userspace drops, unresolved identity counts when available, and session termination state.
+
+`--verify` adds a read-only verification assessment. Verification is never required to inspect counters.
+
+## Interpret the result
+
+| Observation | What it means |
+| --- | --- |
+| `filtered_events` above zero | Out-of-scope events were rejected in target-tree mode. Not collection loss. |
+| `ringbuf_lost_events` or `userspace_dropped_events` above zero | Evidence is incomplete. Negative claims are limited. |
+| `malformed_events` above zero | Samples failed strict decoding and were discarded. |
+| Unresolved identity or ancestry | Attribution is limited; the event is still recorded evidence. |
+| `recording` status | The recorder did not finalize. Treat the session as incomplete. |
+| `valid_but_incomplete` from verification | The record is consistent where checked, but evidence is incomplete. |
+
+Absence of a row is never proof that activity did not occur.
+
+## Machine-readable output
+
+Every inspection command supports `--json`. JSON output is valid UTF-8 and preserves nulls for unavailable values rather than inventing placeholders.
+
+```bash
+syscall --json inspect <SESSION_ID>
+syscall --json timeline <SESSION_ID> --limit 10
+syscall --json files <SESSION_ID> --result failure
+```
+
+Use [Behavioral analysis](/guides/analyze) to turn patterns into explainable findings, and [Verification](/guides/verify) to check the session's internal consistency.

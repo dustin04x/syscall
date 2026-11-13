@@ -1,0 +1,188 @@
+---
+title: "Installation"
+description: "Install the build dependencies, compile the CLI and eBPF programs, and verify host readiness."
+---
+
+SYSCALL is built from source. There is no package manager installation, signed installer, or prebuilt desktop bundle in this revision.
+
+## Supported environment
+
+| Area | Requirement |
+| --- | --- |
+| Platform | Linux x86_64 |
+| Kernel | BPF, BTF, tracefs, and ring-buffer support. 5.8 or later is typical. |
+| Rust | 1.82 or later, edition 2021 |
+| eBPF build | `clang`, `llvm-objdump`, make, libbpf headers and library, `pkg-config` |
+| Desktop build | Node.js 20 or later, WebKitGTK 4.1, GTK 3, and related Tauri packages |
+| Recording privilege | Root, `CAP_BPF` + `CAP_PERFMON`, or `CAP_SYS_ADMIN` on older kernels |
+
+The collector uses fixed tracepoint context structs rather than CO-RE. The build checks those layouts against the running kernel's BTF before the programs are considered usable.
+
+## Install build dependencies
+
+On Debian or Ubuntu:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y \
+  build-essential clang llvm libbpf-dev pkg-config
+```
+
+For the desktop application:
+
+```bash
+sudo apt-get install -y \
+  curl wget file \
+  libwebkit2gtk-4.1-dev libgtk-3-dev \
+  libayatana-appindicator3-dev librsvg2-dev \
+  libxdo-dev libssl-dev
+```
+
+Install Node.js 20 or later through your normal toolchain. A current stable Rust toolchain can be installed with `rustup`.
+
+`bpftool` is not required. `libbpf-cargo` invokes clang and generates the Rust skeleton during the Cargo build.
+
+## Build
+
+Build only the CLI when you do not need the desktop packages:
+
+```bash
+cargo build --release -p syscall-cli
+```
+
+Build the full workspace when the desktop prerequisites are installed:
+
+```bash
+cargo build --workspace
+```
+
+The CLI binary is `target/release/syscall`. The desktop release binary is `target/release/syscall-workbench` after a Tauri release build.
+
+## Check the eBPF object
+
+```bash
+make -C ebpf clean check
+```
+
+A successful check includes seven tracepoint sections and the expected maps and license metadata:
+
+```text
+tracepoint/sched/sched_process_exec
+tracepoint/sched/sched_process_fork
+tracepoint/sched/sched_process_exit
+tracepoint/syscalls/sys_enter_openat
+tracepoint/syscalls/sys_exit_openat
+tracepoint/syscalls/sys_enter_connect
+tracepoint/syscalls/sys_exit_connect
+```
+
+The `_Static_assert` checks in `ebpf/syscall.bpf.c` enforce context and event sizes at compile time. A layout mismatch fails the build instead of producing a truncated sample.
+
+## Verify tracepoint layouts
+
+```bash
+scripts/check-btf-layout.sh
+```
+
+The check reads `/sys/kernel/btf/vmlinux` and verifies the fields used by the programs. It is read-only and works without root when BTF is readable.
+
+Expected result:
+
+```text
+PASS trace_event_raw_sched_process_exec             size=20 members verified
+PASS trace_event_raw_sched_process_fork             size=48 members verified
+PASS trace_event_raw_sched_process_template         size=32 members verified
+
+All tracepoint context layouts match the running kernel BTF.
+```
+
+If this fails, do not load the program. Update the context structs, payload offsets, and decoder together; bump the wire schema if the wire layout changes.
+
+## Inspect the host
+
+```bash
+target/release/syscall info
+```
+
+The report includes:
+
+- Kernel release and distribution details when available.
+- Whether `/sys/kernel/btf/vmlinux` is readable.
+- Whether tracefs is mounted and readable.
+- Availability of the seven tracepoints, or `unknown` when tracefs cannot be read.
+- Effective UID and capability mask.
+- Whether unprivileged BPF is disabled.
+- The selected database path and whether it exists.
+
+Use `--json` for automation:
+
+```bash
+target/release/syscall info --json
+```
+
+`info` never loads BPF and never changes host settings.
+
+## Recording privilege
+
+Run the recorder through sudo or grant the binary the required capabilities. SYSCALL does not call sudo itself.
+
+```bash
+sudo target/release/syscall record -- /usr/bin/sleep 5
+```
+
+When launched through sudo, the collector:
+
+1. Loads and attaches the eBPF programs while privileged.
+2. Reads `SUDO_UID` and `SUDO_GID`.
+3. Drops supplementary groups, GID, and UID to the invoking user.
+4. Verifies the drop and sets `umask 077`.
+5. Creates the database and spawns the target as that user.
+
+If SYSCALL is launched from a root shell with no `SUDO_UID`, it remains root and the target runs as root. That is an explicit operator choice.
+
+The data directory is mode `0700`, the database is mode `0600`, and SQLite WAL/SHM sidecars inherit the restrictive umask.
+
+## Default paths
+
+| Path | Default |
+| --- | --- |
+| Data directory | `~/.local/share/syscall` |
+| Session database | `~/.local/share/syscall/syscall.db` |
+| Desktop export directory | `~/.local/share/syscall/exports` |
+
+Override the database per invocation:
+
+```bash
+syscall --db /path/to/evidence.db sessions
+```
+
+`SYSCALL_DB` is the environment equivalent. The desktop resolves its database once at startup from `--db` or `SYSCALL_DB`; frontend requests cannot change it.
+
+## Database compatibility
+
+Inspection and verification open SQLite read-only. They do not migrate a database.
+
+- A missing schema or an unsupported newer schema is rejected explicitly.
+- A writable recorder applies pending migrations in a transaction.
+- Historical rows are not rewritten during a read-only open.
+- Use a database produced by a compatible collector and storage schema. The current SQLite schema is version 5.
+
+Read-only opens verify `PRAGMA user_version` before querying. See [Schemas](/reference/schemas) for the version contract.
+
+## Documentation preview
+
+The documentation site lives in `docs/` and uses Mintlify. Preview it locally:
+
+```bash
+cd docs
+npx mint dev --no-open
+```
+
+The preview prints a local URL. Validate links and configuration before publishing:
+
+```bash
+npx mint validate
+npx mint broken-links
+```
+
+See [Development](/project/development) for the complete contributor workflow.

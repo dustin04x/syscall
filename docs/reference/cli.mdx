@@ -1,0 +1,344 @@
+---
+title: "CLI reference"
+description: "Complete command reference for recording, inspecting, analyzing, verifying, and exporting SYSCALL evidence."
+---
+
+The CLI binary is `syscall`. Recording requires privilege; every inspection, analysis, verification, and export command is read-only and unprivileged.
+
+## Usage
+
+```text
+syscall [GLOBAL OPTIONS] <COMMAND> [OPTIONS]
+```
+
+Global options may appear before or after the subcommand because they are propagated.
+
+## Global options
+
+| Option | Environment | Meaning |
+| --- | --- | --- |
+| `--db PATH` | `SYSCALL_DB` | Session database path |
+| `--json` | | Emit machine-readable JSON |
+| `--help` | | Print command help |
+| `--version` | | Print the version |
+
+The default database is `~/.local/share/syscall/syscall.db`.
+
+```bash
+syscall --db /evidence/session.db sessions
+syscall sessions --db /evidence/session.db --json
+```
+
+## Commands
+
+| Command | Purpose |
+| --- | --- |
+| [`info`](#info) | Report host and database readiness |
+| [`record`](#record) | Record a target command |
+| [`sessions`](#sessions) | List recorded sessions |
+| [`inspect`](#inspect) | Summarize one session |
+| [`events`](#events) | List raw persisted events |
+| [`processes`](#processes) | List process instances |
+| [`tree`](#tree) | Show the process hierarchy |
+| [`timeline`](#timeline) | Paged investigation timeline |
+| [`files`](#files) | File-open attempts |
+| [`connections`](#connections) | IPv4/IPv6 connect attempts |
+| [`stats`](#stats) | Session statistics and accounting |
+| [`analyze`](#analyze) | Run deterministic behavioral rules |
+| [`verify`](#verify) | Verify session consistency |
+| [`export`](#export) | Export an evidence package |
+| [`verify-export`](#verify-export) | Verify an exported manifest |
+
+## info
+
+```bash
+syscall info [--json]
+```
+
+Reports the platform, kernel, BTF, tracefs, tracepoint visibility, effective privilege, unprivileged BPF setting, and selected database path. It does not load BPF or modify the host.
+
+## record
+
+```bash
+syscall record [OPTIONS] -- <COMMAND> [ARGUMENTS...]
+```
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `--scope target-tree\|system` | `target-tree` | Attribution scope |
+| `--redact-args` | Off | Store `"<redacted>"` for target arguments |
+| `--session-id ID` | Generated | Override the session identifier |
+| `--db PATH` | User data directory | Database path |
+| `--json` | Off | JSON record report |
+
+The `--` separator is required. The target is executed directly, not through a shell.
+
+```bash
+sudo syscall record -- /usr/bin/sleep 5
+sudo syscall record --redact-args -- /opt/tool/run --token=secret
+sudo syscall record --scope system --db /evidence/host.db -- /bin/true
+```
+
+Scope controls userspace admission, not kernel visibility. See [Record a session](/guides/record).
+
+### Record exit codes
+
+| Outcome | Exit |
+| --- | ---: |
+| Target exited normally | Target's code |
+| Target terminated by signal `N` | `128 + N` |
+| Recorder SIGINT | `130` |
+| Recorder SIGTERM | `143` |
+| Recording or finalization failed | `1` |
+| No target outcome | `0` |
+
+## sessions
+
+```bash
+syscall sessions [--limit N] [--json]
+```
+
+| Option | Default | Meaning |
+| --- | ---: | --- |
+| `--limit N` | `50` | Maximum sessions to list |
+
+Sessions are listed newest first with status, scope, time, event count, and duration.
+
+## inspect
+
+```bash
+syscall inspect <SESSION_ID> [--json]
+```
+
+Shows session metadata, arguments as recorded, scope, status, termination state, event counts, collection counters, loss counters, and observed processes.
+
+A missing session is an error, not an empty result.
+
+## events
+
+```bash
+syscall events <SESSION_ID> [OPTIONS]
+```
+
+| Option | Default | Meaning |
+| --- | ---: | --- |
+| `--limit N` | `100` | Maximum events |
+| `--offset N` | `0` | Events to skip |
+| `--type TYPE` | All | One event type |
+| `--pid PID` | All | Canonical recorded PID |
+
+Valid event types:
+
+```text
+process_exec
+process_fork
+process_exit
+file_open
+network_connect
+```
+
+Unknown or uncollected types are rejected.
+
+## processes
+
+```bash
+syscall processes <SESSION_ID> [--json]
+```
+
+Lists process instances derived from recorded events, including canonical identity, PID, command evidence, parent linkage when resolved, first and last observation, event count, exit observation, and unresolved flags.
+
+## tree
+
+```bash
+syscall tree <SESSION_ID> [--json]
+```
+
+Renders recorded process relationships by process-instance identity. Ambiguous PID-reuse matches are left unresolved, missing parents are marked, and cycles are reported.
+
+## timeline
+
+```bash
+syscall timeline <SESSION_ID> [OPTIONS]
+```
+
+| Option | Default | Meaning |
+| --- | ---: | --- |
+| `--limit N` | `200` | Maximum events |
+| `--offset N` | `0` | Events to skip |
+| `--type TYPE` | All | One event type |
+| `--pid PID` | All | Canonical recorded PID |
+| `--process-instance ID` | All | Exact process-instance ID |
+| `--from TIME` | None | Inclusive lower time bound |
+| `--to TIME` | None | Inclusive upper time bound |
+
+Ordering is `timestamp_ns ASC, monotonic_ns ASC, id ASC`.
+
+```bash
+syscall timeline <SESSION_ID> --type process_exec
+syscall timeline <SESSION_ID> --process-instance 'boot:1234:5678'
+syscall timeline <SESSION_ID> --from 2026-11-10T12:00:00Z --to 2026-11-10T12:05:00Z
+```
+
+## files
+
+```bash
+syscall files <SESSION_ID> [OPTIONS]
+```
+
+| Option | Default | Meaning |
+| --- | ---: | --- |
+| `--limit N` | `200` | Maximum file-open events |
+| `--offset N` | `0` | Events to skip |
+| `--pid PID` | All | Canonical recorded PID |
+| `--process-instance ID` | All | Exact process-instance ID |
+| `--from TIME` | None | Inclusive lower time bound |
+| `--to TIME` | None | Inclusive upper time bound |
+| `--result success\|failure` | All | Attempt outcome |
+
+```bash
+syscall files <SESSION_ID> --result failure
+syscall files <SESSION_ID> --pid 1234 --json
+```
+
+Paths are raw `openat` arguments and may be relative or truncated. See [Investigate a session](/guides/investigate#follow-filesystem-attempts).
+
+## connections
+
+```bash
+syscall connections <SESSION_ID> [OPTIONS]
+```
+
+| Option | Default | Meaning |
+| --- | ---: | --- |
+| `--limit N` | `200` | Maximum connect attempts |
+| `--offset N` | `0` | Events to skip |
+| `--pid PID` | All | Canonical recorded PID |
+| `--process-instance ID` | All | Exact process-instance ID |
+| `--from TIME` | None | Inclusive lower time bound |
+| `--to TIME` | None | Inclusive upper time bound |
+| `--family ipv4\|ipv6` | All | Address family |
+| `--result success\|failure` | All | Attempt outcome |
+
+```bash
+syscall connections <SESSION_ID> --family ipv6
+syscall connections <SESSION_ID> --result failure --json
+```
+
+A successful connect means the syscall returned `0`. It does not prove an established session, TCP or UDP, reachability, or data transfer.
+
+## stats
+
+```bash
+syscall stats <SESSION_ID> [--verify] [--json]
+```
+
+| Option | Meaning |
+| --- | --- |
+| `--verify` | Add a read-only verification assessment |
+
+Reports duration, process-instance count, event counts, collection and loss counters, unresolved identity count when available, and session termination state.
+
+## analyze
+
+```bash
+syscall analyze <SESSION_ID> [OPTIONS]
+```
+
+| Option | Meaning |
+| --- | --- |
+| `--rule RULE_ID` | Run only one rule |
+| `--severity LEVEL` | Inclusive minimum severity |
+| `--min-confidence LEVEL` | Inclusive minimum confidence |
+| `--config FILE` | Strict JSON configuration |
+| `--output FILE` | Write output to a mode-`0600` file |
+| `--json` | Emit `syscall-analysis/v1` |
+
+Severity: `informational` (or `info`), `low`, `medium`, `high`, `critical`.
+
+Confidence: `low`, `medium`, `high`.
+
+Rule IDs:
+
+```text
+SYSCALL-SHELL-CHAIN
+SYSCALL-TEMP-EXEC
+SYSCALL-SENSITIVE-OPEN
+SYSCALL-REPEATED-CONNECT
+SYSCALL-FS-NET-CORRELATION
+SYSCALL-SHORT-LIVED-NET
+```
+
+```bash
+syscall analyze <SESSION_ID>
+syscall analyze <SESSION_ID> --rule SYSCALL-TEMP-EXEC
+syscall analyze <SESSION_ID> --severity high --json
+syscall analyze <SESSION_ID> --config ./analysis.json --output ./analysis.txt
+```
+
+`--output` truncates an existing file and sets mode `0600`. It does not imply `--json`; the text or JSON format follows the other flags.
+
+## verify
+
+```bash
+syscall verify <SESSION_ID> [--json]
+```
+
+Read-only session verification. It never migrates, repairs, or rewrites the database.
+
+| Exit | Assessment |
+| ---: | --- |
+| `0` | `valid` |
+| `2` | `valid_but_incomplete` or `warning` |
+| `3` | `invalid` |
+| `4` | `unable_to_verify` |
+
+## export
+
+```bash
+syscall export <SESSION_ID> --output FILE [OPTIONS]
+```
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `--format json` | `json` | Export format |
+| `--output FILE` | Required | Destination path |
+| `--force` | Off | Replace an existing file |
+| `--json` | Off | Emit the export result as JSON |
+
+The destination directory must exist. The package is written atomically with mode `0600`. Existing files are not replaced without `--force`.
+
+```bash
+syscall export <SESSION_ID> --format json --output ./evidence.json
+```
+
+## verify-export
+
+```bash
+syscall verify-export <PACKAGE> [--json]
+```
+
+Verifies the package format, manifest entries, byte lengths, and SHA-256 hashes without modifying the file.
+
+| Exit | Meaning |
+| ---: | --- |
+| `0` | Manifest valid |
+| `1` | Manifest invalid |
+
+## Time inputs
+
+`--from` and `--to` accept:
+
+- Integer nanoseconds since the Unix epoch.
+- RFC3339 UTC timestamps ending in `Z` or `z`, such as `2026-11-10T12:34:56Z` or `2026-11-10T12:34:56.123456789Z`.
+
+If both bounds are supplied, `--from` must be less than or equal to `--to`.
+
+## Output and errors
+
+- Text output is intended for people and escapes control characters in untrusted fields.
+- JSON output is valid UTF-8 and preserves nulls for unavailable values.
+- Diagnostics go to stderr; data goes to stdout.
+- Input, schema, and read failures return non-zero and do not modify evidence.
+- Read-only commands never migrate or repair a database.
+
+For command workflows, see [Record](/guides/record), [Investigate](/guides/investigate), [Analyze](/guides/analyze), [Verify](/guides/verify), and [Export](/guides/export).

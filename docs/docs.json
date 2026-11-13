@@ -1,0 +1,154 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "name": "SYSCALL",
+  "description": "Linux runtime forensics built on real kernel telemetry. Record process, file-open, and network-connect activity, then investigate the evidence from the CLI or a read-only workbench.",
+  "theme": "luma",
+  "colors": {
+    "primary": "#B23A2E",
+    "light": "#C44A3C",
+    "dark": "#8E2C22"
+  },
+  "logo": {
+    "light": "/assets/wordmark-light.svg",
+    "dark": "/assets/wordmark-dark.svg"
+  },
+  "favicon": "/assets/mark.svg",
+  "appearance": {
+    "default": "system"
+  },
+  "fonts": {
+    "heading": {
+      "family": "Space Grotesk"
+    },
+    "body": {
+      "family": "Inter"
+    }
+  },
+  "icons": {
+    "library": "lucide"
+  },
+  "background": {
+    "decoration": "grid"
+  },
+  "styling": {
+    "eyebrows": "breadcrumbs"
+  },
+  "navbar": {
+    "links": [
+      {
+        "type": "github",
+        "href": "https://github.com/dustin04x/syscall"
+      }
+    ],
+    "primary": {
+      "type": "button",
+      "label": "Quickstart",
+      "href": "/quickstart"
+    }
+  },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/dustin04x/syscall"
+    },
+    "links": [
+      {
+        "header": "Documentation",
+        "items": [
+          {
+            "label": "Quickstart",
+            "href": "/quickstart"
+          },
+          {
+            "label": "CLI reference",
+            "href": "/reference/cli"
+          },
+          {
+            "label": "Architecture",
+            "href": "/project/architecture"
+          }
+        ]
+      },
+      {
+        "header": "Project",
+        "items": [
+          {
+            "label": "GitHub",
+            "href": "https://github.com/dustin04x/syscall"
+          },
+          {
+            "label": "Issues",
+            "href": "https://github.com/dustin04x/syscall/issues"
+          },
+          {
+            "label": "Roadmap",
+            "href": "/project/roadmap"
+          }
+        ]
+      }
+    ]
+  },
+  "navigation": {
+    "groups": [
+      {
+        "group": "Get started",
+        "icon": "play",
+        "pages": [
+          "index",
+          "quickstart",
+          "installation"
+        ]
+      },
+      {
+        "group": "Concepts",
+        "icon": "layers",
+        "pages": [
+          "concepts/how-it-works",
+          "concepts/identity-and-scope",
+          "concepts/evidence-model"
+        ]
+      },
+      {
+        "group": "Guides",
+        "icon": "compass",
+        "pages": [
+          "guides/record",
+          "guides/investigate",
+          "guides/analyze",
+          "guides/verify",
+          "guides/export",
+          "guides/workbench"
+        ]
+      },
+      {
+        "group": "Reference",
+        "icon": "terminal",
+        "pages": [
+          "reference/cli",
+          "reference/schemas",
+          "reference/analysis-rules",
+          "reference/export-format"
+        ]
+      },
+      {
+        "group": "Operations",
+        "icon": "shield-check",
+        "pages": [
+          "operations/security",
+          "operations/limitations",
+          "operations/wsl",
+          "operations/troubleshooting"
+        ]
+      },
+      {
+        "group": "Project",
+        "icon": "hammer",
+        "pages": [
+          "project/architecture",
+          "project/development",
+          "project/testing",
+          "project/roadmap"
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,126 @@
+---
+title: "Evidence model"
+description: "What a SYSCALL session stores, which counters matter, and what the record can and cannot establish."
+---
+
+A SYSCALL session is a bounded collection of persisted events plus the metadata needed to interpret them. The database is an evidence record, not a complete reconstruction of the host.
+
+## Session lifecycle
+
+| Status | Meaning |
+| --- | --- |
+| `starting` | The session row exists but collection has not fully begun. |
+| `recording` | Collection is in progress, or the recorder terminated without finalizing. |
+| `completed` | The target exited and finalization completed. |
+| `interrupted` | A recorder signal stopped collection; the session was finalized with an interruption. |
+| `failed` | Collection or finalization failed. Already-committed rows remain. |
+
+A `recording` status after the recorder is gone usually means a hard crash. The data is still readable, but the session is incomplete and should be treated that way.
+
+## What each event establishes
+
+| Event | Establishes | Does not establish |
+| --- | --- | --- |
+| `process_exec` | A recorded process image execution and its observed identity | That the executable file was unmodified or trusted |
+| `process_fork` | Observed creation and recorded lineage | That every descendant was captured |
+| `process_exit` | Observed exit for a tracked instance | A complete lifetime if earlier events were lost |
+| `file_open` | An `openat` attempt and its raw result | That contents were read or written, or that a relative path resolved to a specific file |
+| `network_connect` | An IPv4/IPv6 `connect` attempt and its raw result | An established connection, TCP or UDP, reachability, or data transfer |
+
+The record preserves raw results and errno values. A failed open or connect is evidence of an attempt, not a recorder error.
+
+## Collection accounting
+
+The session counters distinguish different reasons why observed activity may not appear as persisted rows.
+
+| Counter | Meaning |
+| --- | --- |
+| `events_received` | Ring-buffer samples received by userspace |
+| `events_decoded` | Samples that passed strict decoding |
+| `events_attributed` | Decoded samples attributed to the selected scope |
+| `events_persisted` | Committed event rows; the authoritative row count |
+| `filtered_events` | Out-of-scope events rejected by target-tree attribution |
+| `events_rejected_scope` | Scope rejections counted separately |
+| `events_rejected_malformed` | Decode or malformed-sample rejections |
+| `events_self_filtered` | Collector-generated samples discarded before attribution |
+| `ringbuf_lost_events` | eBPF ring-buffer output failures |
+| `userspace_dropped_events` | Events dropped because the bounded userspace channel was full |
+| `events_persist_failed` | Persistence failure indicator |
+| `malformed_events` | Recorded malformed-sample count |
+
+`filtered_events` is not the same as loss. It is activity outside the selected target tree. Ring-buffer loss, userspace drops, malformed samples, and persistence failures are collection gaps.
+
+A session can be internally consistent and still be incomplete. Verification reports both dimensions.
+
+## Completeness and confidence
+
+Evidence is **complete** only when the session is completed, loss counters are zero, identity and ancestry are resolved, persistence did not fail, and any bounded scan was not truncated.
+
+When completeness is not established:
+
+- Findings and reports carry explicit limitations.
+- Analysis downgrades confidence.
+- Verification may return `valid_but_incomplete` rather than `valid`.
+- The workbench shows collection accounting separately from attribution limitations.
+
+Absence of an event is not proof that activity did not occur. This is especially important for negative conclusions about network connections, file access, or process behavior.
+
+## Redaction
+
+Target arguments are stored in the session row by default because they can be forensically useful. They can also contain secrets.
+
+```bash
+sudo syscall record --redact-args -- some-command --token=secret
+```
+
+This stores `"<redacted>"` for all target arguments while retaining the command path. Redaction is preserved by inspection and export; original argument values are not present in the database.
+
+`--redact-args` does not redact file paths, network destinations, process names, or the command path. Record only activity you are authorized to collect.
+
+## Verification is not authenticity
+
+`syscall verify` checks internal consistency:
+
+- Database and schema structure.
+- Session lifecycle and timestamp sanity.
+- Event ordering and row-count reconciliation.
+- Payload and identity consistency.
+- Activity result, errno, address, and path semantics.
+- Collection accounting.
+
+It cannot prove that the database was authentic before verification, that no events were missed, or that the kernel was uncompromised. A `valid` assessment means the checks that could run did not find contradictions.
+
+## Export is not chain of custody
+
+An evidence package contains deterministic components and a SHA-256 manifest. The manifest detects post-export changes when recomputed the same way, but it is not a digital signature and does not establish who handled the file.
+
+Use verification, hashing, and your own custody records for the guarantees they actually provide. See [Verification](/guides/verify) and [Export format](/reference/export-format).
+
+## Data not collected
+
+SYSCALL does not capture:
+
+- File contents or memory.
+- Packet payloads, DNS names, or application protocols.
+- Environment variables or keystrokes.
+- Command output.
+- Activity from syscalls it does not hook, including `open`, `openat2`, `sendto`, `sendmsg`, and `accept`.
+
+Target arguments are the exception among command-line data: they are stored unless `--redact-args` is used.
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="Collection and decoding" icon="workflow" href="/concepts/how-it-works">
+    Tracepoints, pairing, ring buffer, writer, and failure behavior.
+  </Card>
+  <Card title="Identity and scope" icon="fingerprint" href="/concepts/identity-and-scope">
+    Process instances, namespace correlation, and target-tree admission.
+  </Card>
+  <Card title="Verification guide" icon="shield-check" href="/guides/verify">
+    Assessments, finding codes, exit codes, and read-only guarantees.
+  </Card>
+  <Card title="Known limitations" icon="triangle-alert" href="/operations/limitations">
+    The gaps that remain in the evidence.
+  </Card>
+</CardGroup>

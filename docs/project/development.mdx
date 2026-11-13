@@ -1,0 +1,213 @@
+---
+title: "Development"
+description: "Set up the toolchain, run the quality gate, work on eBPF and storage, and validate privileged paths safely."
+---
+
+## Prerequisites
+
+Checked environment:
+
+- Ubuntu 24.04 on WSL2, kernel `6.6.87.2-microsoft-standard-WSL2`, x86_64.
+- Rust 1.99.1 through rustup.
+- clang/LLVM 18.1.3, `llvm-objdump`, `make`, `pkg-config`.
+- libbpf 1.3.0 development package.
+- Readable `/sys/kernel/btf/vmlinux`.
+
+Typical Debian/Ubuntu packages:
+
+```bash
+sudo apt-get install build-essential clang llvm libbpf-dev pkg-config
+```
+
+Desktop packages are listed in [Installation](/installation#install-build-dependencies).
+
+`bpftool` is not required. `libbpf-cargo` invokes clang and generates `syscall.skel.rs` during the build.
+
+## Build and test
+
+```bash
+cargo build --workspace
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
+
+The workspace denies `unsafe_op_in_unsafe_fn`; every unsafe block needs a safety comment.
+
+The full workspace includes the Tauri crate and needs the desktop development packages. For a headless desktop check:
+
+```bash
+cargo test -p syscall-desktop --no-default-features
+npm --prefix desktop test
+npm --prefix desktop run build
+```
+
+The `desktop-app` feature gates the Tauri runner. `scripts/check.sh` falls back to the headless service layer when WebKitGTK and GTK development packages are absent.
+
+## Repository quality gate
+
+```bash
+./scripts/check.sh
+```
+
+The gate covers:
+
+- Formatting.
+- Clippy with warnings denied.
+- Workspace tests.
+- CLI and collector builds.
+- eBPF compilation and skeleton generation.
+- BTF layout inspection.
+- Desktop build and renderer tests.
+- Both frontend builds.
+
+The CI runner's kernel BTF layout can differ from a local WSL2 kernel, so the CI BTF step is advisory. The local gate enforces it.
+
+## eBPF development
+
+Compile the object without Rust:
+
+```bash
+make -C ebpf clean check
+```
+
+Expected sections:
+
+```text
+tracepoint/sched/sched_process_exec
+tracepoint/sched/sched_process_fork
+tracepoint/sched/sched_process_exit
+tracepoint/syscalls/sys_enter_openat
+tracepoint/syscalls/sys_exit_openat
+tracepoint/syscalls/sys_enter_connect
+tracepoint/syscalls/sys_exit_connect
+license
+.maps
+```
+
+The `_Static_assert` checks in `ebpf/syscall.bpf.c` enforce context and event sizes at compile time.
+
+Generate the skeleton through Cargo:
+
+```bash
+cargo build -p syscall-collector
+find target -path '*syscall-collector*/out/syscall.skel.rs'
+```
+
+`build.rs` passes `-D__TARGET_ARCH_x86` and explicit x86_64/libc include paths. Another architecture requires updating both the Makefile and `build.rs`.
+
+## Verify tracepoint layouts
+
+```bash
+scripts/check-btf-layout.sh
+```
+
+The helper checks:
+
+| Struct | Size | Members |
+| --- | ---: | --- |
+| `trace_event_raw_sched_process_exec` | 20 | `ent@0`, `__data_loc_filename@8`, `pid@12`, `old_pid@16` |
+| `trace_event_raw_sched_process_fork` | 48 | `ent@0`, `parent_comm@8`, `parent_pid@24`, `child_comm@28`, `child_pid@44` |
+| `trace_event_raw_sched_process_template` | 32 | `ent@0`, `comm@8`, `pid@24`, `prio@28` |
+
+Offsets in the BTF helper are bit offsets; divide by 8 for byte offsets. The check is read-only and needs no root when BTF is readable.
+
+If it fails, do not load the program. Update the structs, offsets, and decoder together, then bump the wire schema if the layout changes.
+
+## Run the collector
+
+```bash
+target/debug/syscall info
+sudo target/debug/syscall record -- /usr/bin/sleep 5
+target/debug/syscall sessions
+target/debug/syscall inspect SESSION_ID
+target/debug/syscall events SESSION_ID
+```
+
+Collector diagnostics:
+
+```bash
+RUST_LOG=syscall_collector=debug,syscall_storage=debug \
+  target/debug/syscall record -- /usr/bin/sleep 1
+```
+
+Diagnostics go to stderr; JSON goes to stdout.
+
+## Privileged testing policy
+
+Unit and integration tests never load BPF and never require root. CI must not fake a kernel pass.
+
+The privileged path is an explicit operator action:
+
+```bash
+cargo build -p syscall-cli
+sudo scripts/e2e-root.sh
+```
+
+The script:
+
+1. Refuses to run unless invoked through sudo for a non-root user.
+2. Verifies `info` reports BPF capability and visible lifecycle tracepoints.
+3. Records a small target tree and inspects it as the invoking user.
+4. Sends SIGINT to a second recording and verifies exit `130` and `interrupted`.
+5. Verifies database ownership and mode `600`.
+
+Never run privileged tests automatically from an agent or CI job without explicit provisioning. Never put a password in a script, environment variable, or command line.
+
+## Diagnosing WSL2 failures
+
+- `unprivileged_bpf_disabled=2` means an unprivileged load must fail.
+- Tracefs is often root-only; `info` reports tracepoint visibility as unknown rather than guessing.
+- `/sys/kernel/btf/vmlinux` must be readable for BTF checks.
+- If skeleton generation fails, verify clang and libbpf, then run `make -C ebpf clean check`.
+- If load fails under root, preserve the exact libbpf error and do not report a pass.
+
+## Add a schema migration
+
+1. Add `crates/syscall-storage/migrations/00N_name.sql`.
+2. Add a `Migration` entry and bump `LATEST_SCHEMA_VERSION`.
+3. Add a migration test that opens version N-1 and verifies version N.
+4. Add read-only rejection tests for future versions.
+5. Update [Schemas](/reference/schemas).
+
+Read-only opens never migrate. Do not silently reinterpret an existing column.
+
+## Add a collected event type
+
+Adding an event requires all of:
+
+1. A real eBPF program with bounded capture.
+2. Wire structs, decoder offsets, and BTF/layout checks.
+3. Payload construction and validation.
+4. Storage and index review.
+5. CLI and desktop rendering.
+6. Root-run e2e evidence.
+
+Do not mark a placeholder as collected. The domain validator rejects schema-only activity variants.
+
+## Documentation
+
+The documentation site uses Mintlify and lives in `docs/`.
+
+```bash
+cd docs
+npx mint dev --no-open
+npx mint validate
+npx mint broken-links
+```
+
+Navigation and theme are configured in `docs/docs.json`. Pages use `.mdx` with frontmatter. Keep the sidebar path in sync with the file path.
+
+The screenshots in `docs/screenshots/` are interface captures from the preview dataset, not live evidence. If you refresh them, label them honestly.
+
+## Change checklist
+
+Before opening a pull request:
+
+- [ ] Formatting and Clippy pass.
+- [ ] Relevant tests pass.
+- [ ] eBPF object and BTF checks pass for kernel-facing changes.
+- [ ] Privileged behavior is documented, not claimed from a unit test.
+- [ ] Schema or wire changes update tests and references.
+- [ ] User-visible changes update the relevant guide.
+- [ ] No secrets, credentials, or unrelated evidence are committed.

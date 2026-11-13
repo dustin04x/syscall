@@ -1,0 +1,195 @@
+---
+title: "Analyze behavior"
+description: "Run deterministic rules over recorded evidence, filter findings, and interpret severity and confidence correctly."
+---
+
+`syscall analyze` reads persisted process, filesystem, and network evidence and emits explainable findings linked to the original event row IDs.
+
+It does not execute recorded commands, assign a malware verdict, or calculate a probability of maliciousness. Findings describe recorded behavior and explain why it may matter.
+
+## Run analysis
+
+```bash
+syscall analyze <SESSION_ID>
+```
+
+Text output includes:
+
+- Session summary and collection status.
+- Evidence completeness and limitations.
+- Evaluated rules.
+- Findings grouped by severity.
+- Explanation, significance, supporting event IDs and details.
+- Related processes and time range.
+- Recommended next steps.
+
+JSON output uses the versioned `syscall-analysis/v1` report:
+
+```bash
+syscall analyze <SESSION_ID> --json
+```
+
+Write output to a mode `0600` file:
+
+```bash
+syscall analyze <SESSION_ID> --json --output ./analysis.json
+```
+
+`--output` truncates an existing file. The default is stdout.
+
+## Filter findings
+
+```bash
+syscall analyze <SESSION_ID> --severity high
+syscall analyze <SESSION_ID> --min-confidence medium
+syscall analyze <SESSION_ID> --rule SYSCALL-TEMP-EXEC
+```
+
+| Option | Meaning |
+| --- | --- |
+| `--rule RULE_ID` | Run only one rule |
+| `--severity LEVEL` | Inclusive minimum severity |
+| `--min-confidence LEVEL` | Inclusive minimum confidence |
+| `--config FILE` | Strict JSON rule configuration |
+| `--output FILE` | Write output to a secured file |
+| `--json` | Emit the versioned JSON report |
+
+Severity levels: `informational`, `low`, `medium`, `high`, `critical`. The parser also accepts `info`.
+
+Confidence levels: `low`, `medium`, `high`.
+
+A disabled rule normally does not run. An explicit `--rule RULE_ID` intentionally overrides the disabled default while still applying bounds.
+
+## Rules
+
+| Rule | ID | Question it helps answer | Default severity |
+| --- | --- | --- | --- |
+| A | `SYSCALL-SHELL-CHAIN` | Did a shell spawn a multi-level descendant tree? | Low |
+| B | `SYSCALL-TEMP-EXEC` | Was an executable launched from a temporary directory? | Medium |
+| C | `SYSCALL-SENSITIVE-OPEN` | Was a configured sensitive path opened or attempted? | Informational to high |
+| D | `SYSCALL-REPEATED-CONNECT` | Did one process repeatedly fail to reach the same destination? | Medium |
+| E | `SYSCALL-FS-NET-CORRELATION` | Did a file open temporally precede a connect in the same process or tree? | Low |
+| F | `SYSCALL-SHORT-LIVED-NET` | Did a short-lived process connect between exec and exit? | Low |
+
+Full conditions, exclusions, false-positive notes, and severity rules are in [Analysis rules](/reference/analysis-rules).
+
+<Warning>
+Rules are contextual indicators. Shell chains, temporary execution, credential-file access, retries, and short-lived network tools are routinely benign. Temporal proximity in Rule E is not proof that data was transmitted.
+</Warning>
+
+## Severity and confidence
+
+Severity is investigative priority:
+
+| Level | Meaning |
+| --- | --- |
+| `informational` | Context or an unresolved observation |
+| `low` | Worth noting, commonly benign |
+| `medium` | Stronger indicator that merits review |
+| `high` | Significant direct behavior, such as a successful credential-file open |
+| `critical` | Reserved for future rules with exceptionally strong evidence; no current default rule emits it |
+
+Confidence describes the directness and quality of the evidence. It is not a calibrated probability.
+
+| Level | Meaning |
+| --- | --- |
+| `high` | Direct evidence, resolved identity and ancestry, complete verified session |
+| `medium` | Direct evidence with losses, ambiguity, truncation, or explicitly temporal correlation |
+| `low` | Missing resolution, indirect correlation, or multiple evidence-quality limitations |
+
+Incomplete sessions downgrade base confidence: `high` becomes `medium`, `medium` becomes `low`, and `low` remains `low`. The finding and report carry an explicit limitation.
+
+## Evidence completeness
+
+The report's evidence status is `complete` only when all of these hold:
+
+- Session status is `completed`.
+- Persisted counters do not indicate loss, drops, recovery, or incomplete identity.
+- The event scan was not truncated by `max_events`.
+- Read-only verification completed with assessment `valid`.
+
+Otherwise the status is `incomplete`, with reasons in the evidence notes and report limitations.
+
+## Configuration
+
+`--config` loads strict JSON. Unknown fields are rejected, and configuration is never executed.
+
+```json
+{
+  "sensitive_paths": [
+    "/etc/shadow",
+    "/etc/gshadow",
+    "/etc/sudoers",
+    "/etc/sudoers.d",
+    "/etc/pam.d",
+    "/etc/ssh/ssh_host_rsa_key",
+    "/etc/ssh/ssh_host_ecdsa_key",
+    "/etc/ssh/ssh_host_ed25519_key",
+    "/root/.ssh"
+  ],
+  "temporary_directories": ["/tmp", "/var/tmp", "/dev/shm", "/run/shm"],
+  "repeated_connection_threshold": 3,
+  "correlation_window_ns": 60000000000,
+  "short_lived_window_ns": 10000000000,
+  "disabled_rules": [],
+  "max_findings": 1000,
+  "max_events": 100000
+}
+```
+
+Paths must be absolute and are lexically normalized. The loader rejects:
+
+- Unknown fields and unknown rule IDs.
+- Duplicate normalized paths or disabled rules.
+- Empty path lists.
+- Root `/` entries.
+- Zero thresholds or windows.
+
+See [Analysis rules](/reference/analysis-rules#configuration) for the full contract.
+
+## Bounds
+
+| Bound | Default |
+| --- | ---: |
+| Events scanned | 100,000 |
+| Findings reported | 1,000 |
+| Supporting events per finding | Capped by the engine |
+| Shell descendants traversed | 1,000 |
+| Process-tree correlation pairs | 200 |
+
+When a bound truncates the work, the report marks it. A truncated analysis is not a complete negative result.
+
+## Investigative workflow
+
+1. Run `stats` and check collection completeness.
+2. Run `analyze` with default rules.
+3. Read the report limitations before the findings.
+4. Follow each finding's event IDs into `timeline` or the workbench.
+5. Check the process tree and identity resolution behind the finding.
+6. Run [Verification](/guides/verify) if integrity matters to the conclusion.
+7. Export the evidence package if the analysis must be shared.
+
+```bash
+syscall stats <SESSION_ID>
+syscall analyze <SESSION_ID>
+syscall timeline <SESSION_ID> --process-instance 'boot:1234:5678'
+syscall verify <SESSION_ID>
+syscall export <SESSION_ID> --format json --output ./evidence.json
+```
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="Rule reference" icon="list-checks" href="/reference/analysis-rules">
+    Exact conditions, exclusions, and confidence rules for A–F.
+  </Card>
+  <Card title="Verification" icon="shield-check" href="/guides/verify">
+    Read-only consistency checks and assessment meanings.
+  </Card>
+  <Card title="Evidence export" icon="package" href="/guides/export">
+    Package findings with the recorded evidence and manifest.
+  </Card>
+  <Card title="Limitations" icon="triangle-alert" href="/operations/limitations">
+    What the analysis cannot establish.
+  </Card>
+</CardGroup>

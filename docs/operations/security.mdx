@@ -1,0 +1,186 @@
+---
+title: "Security and threat model"
+description: "Privilege boundaries, collected data, storage protections, denial-of-service bounds, and known security limits."
+---
+
+SYSCALL is a local forensic recorder. It assumes a trusted operator who may explicitly run a privileged command and an untrusted set of observed processes.
+
+It does not defend against a malicious root user, a compromised kernel, or a host already under privileged attack.
+
+## Privilege model
+
+Loading and attaching eBPF requires one of:
+
+- Effective UID 0.
+- `CAP_BPF` + `CAP_PERFMON` on Linux 5.8 or later.
+- `CAP_SYS_ADMIN` on older kernels.
+
+SYSCALL never calls `sudo`, prompts for a password, or stores credentials.
+
+```bash
+sudo /absolute/path/to/syscall record \
+  --db /home/alice/.local/share/syscall/syscall.db \
+  -- /usr/bin/sleep 5
+```
+
+When started through sudo:
+
+1. The process loads and attaches BPF as root.
+2. It reads `SUDO_UID` and `SUDO_GID`.
+3. It calls `setgroups(0)`, `setgid`, and `setuid`.
+4. It verifies the effective IDs changed.
+5. It sets `umask 077`.
+6. Only then does it create the database and spawn the target.
+
+Consequences:
+
+- The target and database are owned by the invoking user.
+- Inspection works later without root.
+- A root shell without `SUDO_UID` remains root, and the target runs as root. Avoid this unless intended.
+- If `SUDO_UID=0`, the drop is skipped.
+- The collector does not regain privilege after the drop.
+
+## Data handling
+
+Collected metadata includes:
+
+- Command name, executable filename for exec, PID/TID/PPID, UID/GID.
+- Raw `openat` path strings, flags, dirfd, and raw result.
+- Connect family, source and destination addresses and ports, and raw result.
+- Timestamps and boot-scoped process-instance identity.
+- Target arguments unless redacted.
+
+Not collected:
+
+- File contents.
+- Environment variables.
+- Process memory.
+- Packet payloads.
+- DNS names.
+- Keystrokes.
+- Command output.
+
+File paths can reveal sensitive names and directory structure. Connect metadata reveals destinations but not payloads.
+
+## Argument redaction
+
+Target arguments are persisted by default because they are useful evidence. They can contain secrets.
+
+```bash
+sudo syscall record --redact-args -- some-command --token=secret
+```
+
+All target arguments become `"<redacted>"`; the command path remains. Arguments are JSON-encoded in SQLite and escaped in text output.
+
+Redaction does not cover file paths or network destinations.
+
+## Storage protections
+
+| Protection | Setting |
+| --- | --- |
+| Data directory | Mode `0700` |
+| Database | Mode `0600` |
+| SQLite WAL/SHM | Created under `umask 077` |
+| Journal mode | WAL |
+| Synchronous | `NORMAL` |
+| Foreign keys | On |
+| Busy timeout | 5000 ms |
+| Trusted schema | Off |
+| Inspection | Read-only with schema version check |
+
+All SQL values are bound parameters. Schema migrations run in transactions and reject newer versions.
+
+The database path is operator-controlled. A user who can replace it can affect their own process, because writes happen after the privilege drop.
+
+## Memory and denial-of-service bounds
+
+| Resource | Bound |
+| --- | ---: |
+| BPF ring buffer | 4 MiB |
+| Userspace channel | 8,192 events |
+| Writer batch | 256 events |
+| Filename/path capture | 256 bytes |
+| Command name | 16 bytes |
+| Syscall pairing maps | 8,192 entries each |
+| `/proc` ancestry walk | 64 levels |
+| Tracked process instances | 65,536 |
+
+Malformed samples are discarded and counted. Out-of-scope and dropped events are counted separately. Activity events use fixed-size wire structs; file-open events are ring-buffer-reserved to avoid exceeding the BPF stack.
+
+A sufficiently busy host can still lose events. Loss counters are persisted and displayed; a session with drops is not presented as complete.
+
+## Input validation
+
+The kernel is treated as untrusted input:
+
+- Magic, schema, type, length, bounds, and NUL termination are checked.
+- PIDs/TIDs must be positive; timestamps must be sane.
+- Strings are decoded lossily but bounded.
+- Domain events are validated before any SQL transaction.
+- Event type and payload variant must agree.
+- Schema-only event types cannot be persisted.
+- Activity result, errno, address family, address length, and ports are checked.
+
+## Terminal and output safety
+
+Process names, filenames, arguments, and stored errors may contain control characters.
+
+- Text output escapes control characters before truncation, preventing ANSI escape injection.
+- JSON uses standard string escaping.
+- Timestamps are rendered as UTC.
+- Untrusted event strings render as React text in the workbench; there is no `dangerouslySetInnerHTML`.
+
+## Argument and path handling
+
+- Target arguments are passed as OS strings without shell evaluation.
+- The `--` separator prevents target flags from being parsed as recorder flags.
+- The target runs in its own process group.
+- Ctrl+C is handled by the collector, which signals the group with SIGTERM and then SIGKILL after a grace period.
+- Error paths use debug formatting that escapes control characters.
+
+## Failure and crash behavior
+
+- A failed writer marks the session `failed` and records the error.
+- An unwind triggers a finalization guard.
+- A hard crash leaves the row in `recording`; committed data remains readable.
+- Signal handlers use an async-signal-safe atomic store; no allocation or locks occur in the handler.
+
+## Desktop boundary
+
+- Database access is read-only.
+- The database path is fixed at startup.
+- One Tauri IPC boundary exposes typed commands.
+- The capability grants only `core:default`.
+- CSP restricts remote script, frame, style, image, font, and connection origins.
+- No SQL, shell, filesystem, dialog, or HTTP plugin is exposed.
+- Export writes only to the backend-selected directory.
+
+## Known security limitations
+
+- Target-tree scope is not a security boundary. The kernel observes system-wide events and userspace filters them.
+- `/proc` reads can race with process exit.
+- Thread-versus-process discrimination is best-effort when the child disappears before `/proc/<pid>/status` can be read.
+- The wall-clock offset is captured once; clock changes can skew derived wall time, though monotonic order remains.
+- File paths are recorded as passed to `openat`, not resolved.
+- A file-open event does not prove data access.
+- A connect event does not prove connection establishment, protocol, or data transfer.
+- Missing syscall pairs or pairing-map evictions are not separately counted; absent activity is not proof of no activity.
+- There is no integrity signature or tamper-evident log. An attacker with write access to the database can modify it.
+- No audit log records who ran the privileged recorder; use OS audit tooling.
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="Limitations" icon="triangle-alert" href="/operations/limitations">
+    Evidence and coverage limits in one table.
+  </Card>
+  <Card title="Workbench security" icon="monitor" href="/guides/workbench#security-boundary">
+    The read-only desktop boundary and fixed paths.
+  </Card>
+  <Card title="Verification" icon="shield-check" href="/guides/verify">
+    What integrity checks can and cannot show.
+  </Card>
+  <Card title="WSL2" icon="terminal" href="/operations/wsl">
+    Privilege and tracefs behavior under WSL2.
+  </Card>
+</CardGroup>

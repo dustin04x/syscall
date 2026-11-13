@@ -1,0 +1,86 @@
+---
+title: "Runtime forensics for Linux"
+sidebarTitle: "Overview"
+description: "Record real kernel activity, preserve attributable evidence, and investigate it from the CLI or a read-only workbench."
+---
+
+SYSCALL records process lifecycle, file-open, and IPv4/IPv6 connect activity with eBPF. It persists the result as a versioned SQLite evidence store and provides two read-only investigation surfaces: a command-line interface and a desktop workbench.
+
+The recorder is a local operator tool. It does not hide the fact that Linux tracepoints are system-wide, and it does not present incomplete collection as complete evidence.
+
+<img src="/screenshots/overview.png" alt="SYSCALL workbench evidence overview" />
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Build the CLI, record a short session, and inspect the result in a few commands.
+  </Card>
+  <Card title="CLI reference" icon="terminal" href="/reference/cli">
+    Every command, option, default, filter, and exit code in one place.
+  </Card>
+  <Card title="How it works" icon="workflow" href="/concepts/how-it-works">
+    Tracepoints, decoding, attribution, storage, and the privilege boundary.
+  </Card>
+  <Card title="Workbench" icon="layout-dashboard" href="/guides/workbench">
+    Open a recorded database in the read-only desktop investigation surface.
+  </Card>
+</CardGroup>
+
+## What a session contains
+
+| Event | Kernel source | What the record establishes |
+| --- | --- | --- |
+| `process_exec` | `sched_process_exec` | A process image was executed, with the recorded filename and identity. |
+| `process_fork` | `sched_process_fork` | A process or thread creation was observed and attributed to a tracked parent. |
+| `process_exit` | `sched_process_exit` | A tracked process exited, with the recorded exit priority. |
+| `file_open` | `openat` enter/exit | An `openat` attempt and its raw return value. It does not prove that file contents were read. |
+| `network_connect` | `connect` enter/exit | An IPv4 or IPv6 `connect` attempt and its raw return value. It does not prove an established connection. |
+
+A session also stores collection accounting, process-instance identity, timestamps, and provenance. That metadata is part of the evidence: a result with ring-buffer loss or unresolved ancestry is not equivalent to a complete recording.
+
+## One recorder, two read paths
+
+```text
+target process tree
+        │
+        ▼
+  eBPF tracepoints ──► ring buffer ──► strict decoder ──► SQLite evidence
+                                                              │
+                                              ┌───────────────┴───────────────┐
+                                              ▼                               ▼
+                                         syscall CLI                  read-only workbench
+```
+
+Both read paths use the same storage queries, analysis engine, verification engine, and export logic. The desktop application does not reimplement forensic rules.
+
+## Design commitments
+
+| Commitment | Consequence |
+| --- | --- |
+| **Real telemetry only** | Collection comes from kernel tracepoints. Synthetic data is confined to the interface preview and is labeled as such. |
+| **Identity before attribution** | Raw BPF IDs, observer-visible IDs, and canonical process instances remain distinct. PID reuse does not merge unrelated processes. |
+| **Incompleteness is visible** | Filtered events, ring-buffer loss, userspace drops, malformed samples, persist failures, and unresolved identity are counted and surfaced. |
+| **Analysis is explainable** | Deterministic rules link findings to persisted event IDs. Severity and confidence are investigative labels, not probabilities or verdicts. |
+| **Investigation is read-only** | Inspection, analysis, verification, and the workbench never modify recorded evidence. Export writes a new package. |
+| **No implicit privilege** | SYSCALL never invokes `sudo`, prompts for a password, or records from the desktop UI. |
+
+## What SYSCALL does not do
+
+<Warning>
+SYSCALL does not capture file contents, packet payloads, memory, environment variables, DNS names, or keystrokes. A successful `connect` is not proof of an established session, TCP or UDP, reachability, or data transfer. An `openat` event is not proof of a read or write.
+</Warning>
+
+It also does not provide tamper-evident storage, a cryptographic chain of custody, kernel-side target filtering, or coverage for syscalls it does not hook. See [Limitations](/operations/limitations) before using the output in an investigation.
+
+## Documentation map
+
+| If you want to... | Start here |
+| --- | --- |
+| Record and inspect a first session | [Quickstart](/quickstart) |
+| Install from source and verify the host | [Installation](/installation) |
+| Understand the evidence model | [Evidence model](/concepts/evidence-model) |
+| Look up a command or option | [CLI reference](/reference/cli) |
+| Run an investigation | [Investigate a session](/guides/investigate) |
+| Interpret findings | [Behavioral analysis](/guides/analyze) |
+| Check evidence consistency | [Verification](/guides/verify) |
+| Produce a portable package | [Evidence export](/guides/export) |
+| Contribute to the codebase | [Development](/project/development) |

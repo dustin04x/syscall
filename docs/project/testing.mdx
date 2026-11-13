@@ -1,0 +1,117 @@
+---
+title: "Testing and validation"
+description: "What has been exercised, what CI proves, and which claims require a privileged operator run."
+---
+
+SYSCALL distinguishes automated checks, offline evidence tests, and privileged live capture. A green unit test is not a kernel PASS.
+
+## Validation status
+
+Last documented validation: **2026-11-13**.
+
+| Area | Status | Evidence |
+| --- | --- | --- |
+| Non-privileged quality gate | Pass | `scripts/check.sh` and GitHub Actions: formatting, Clippy, workspace tests, CLI and collector builds, eBPF compile and skeleton, desktop build and renderer tests, both frontend builds |
+| Live kernel load and attach | Pass | Operator-run WSL2 e2e on 2026-11-10; all seven tracepoints attached |
+| Identity integrity | Pass | Live e2e plus unit tests; raw, observer, and canonical identity recorded |
+| Signal handling | Pass | SIGINT exited `130`, session finalized as `interrupted` |
+| Filesystem activity | Pass | Live `openat` capture with raw paths, flags, results, errno, truncation and relative-path limits |
+| Network activity | Pass | Live IPv4 and IPv6 `connect` attempts with `-111` |
+| Behavioral analysis | Pass, offline | Deterministic rules over real temporary SQLite evidence; no privileged live claim |
+| Desktop workbench | Pass | Release binary launched under WSLg; renderer and real-SQLite service tests pass |
+| BTF layout in CI | Advisory | CI runner kernel differs from the validated WSL2 kernel; the local gate enforces the check |
+
+Phase 5 live runs persisted:
+
+- **72 events**: 64 file opens, 1 IPv4 connect.
+- **315 events**: 2 connects, IPv4 and IPv6.
+
+Both sessions verified `valid` with zero findings.
+
+## Test layers
+
+| Layer | What it proves | What it does not prove |
+| --- | --- | --- |
+| Unit tests | Decoding, validation, identity, path, clock, and renderer logic | Kernel attach or live capture |
+| Storage integration tests | SQLite schema, queries, pagination, verification, export behavior | Privileged recording |
+| Analysis tests | Rule conditions, exclusions, confidence, determinism, read-only access | Live kernel behavior |
+| Desktop service tests | Real temporary SQLite through the command-independent service layer | GUI interaction |
+| Renderer tests | Routes, filters, screens, and IPC-facing behavior with controlled data | Real database semantics |
+| eBPF compile and BTF check | Object sections and running-kernel layout compatibility | Successful load or attach |
+| Privileged e2e | Load, attach, capture, identity, signals, ownership | Every workload or loss scenario |
+
+## Automated checks
+
+```bash
+./scripts/check.sh
+```
+
+Individual checks:
+
+```bash
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+make -C ebpf clean check
+scripts/check-btf-layout.sh
+npm --prefix desktop test
+npm --prefix desktop run build
+npm --prefix ui run build
+```
+
+The workspace test command includes the Tauri crate and needs desktop development packages. Headless mode:
+
+```bash
+cargo test -p syscall-desktop --no-default-features
+```
+
+## Privileged e2e
+
+```bash
+cargo build -p syscall-cli
+sudo scripts/e2e-root.sh
+```
+
+The script verifies:
+
+- Invocation through sudo for a non-root user.
+- BPF capability and visible lifecycle tracepoints.
+- A recorded target tree is inspectable as the invoking user.
+- SIGINT exits `130` and finalizes `interrupted`.
+- The database is user-owned with mode `600`.
+
+The Phase 5 manual capture is documented in [WSL2 compatibility](/operations/wsl).
+
+## Desktop validation
+
+The workbench validation covered:
+
+- Release build with `tauri build --no-bundle`.
+- WSLg launch at 1480×920 with software rendering.
+- Opening a real recorded session read-only.
+- Session search, process tree, timeline, filesystem, network, analysis, verification, and export screens.
+- A 64,138-byte JSON export with mode `0600` and a rendered manifest.
+- 30 renderer tests and 8 real-SQLite service tests.
+
+The screenshots in the docs use the standalone renderer's deterministic preview data; they are not live evidence.
+
+## What CI does not prove
+
+- That eBPF loads on the runner.
+- That tracepoints attach.
+- That live filesystem or network activity is captured.
+- That privilege dropping works on the target host.
+- That the workbench renders correctly in a real window.
+- That a database was authentic or untampered.
+
+Those require the operator-run checks or external controls.
+
+## Remaining validation gaps
+
+- Native Linux host run beyond WSL2.
+- Stress and sustained ring-buffer loss.
+- Crash injection that leaves a `recording` session.
+- Privileged CI with explicit provisioning.
+- Automated GUI end-to-end testing.
+
+See [Roadmap](/project/roadmap).

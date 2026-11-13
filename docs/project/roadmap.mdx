@@ -1,0 +1,92 @@
+---
+title: "Roadmap"
+description: "Delivered capabilities, open evidence work, and the boundaries the project intends to keep."
+---
+
+## Delivered
+
+### Phase 1–4: lifecycle and investigation
+
+- Real exec, fork, and exit tracepoint programs.
+- Ring buffer and strict decoder.
+- Target-tree and system attribution with PID-reuse-safe identity.
+- SQLite sessions, batched writes, indexes, schema versioning, and read-only inspection.
+- CLI inspection, timeline, statistics, verification, and export.
+- Non-privileged quality gate and BTF layout check.
+- WSL2 validation report.
+
+Privileged proof completed 2026-11-10: lifecycle capture, SIGINT handling, and user-owned database checks passed.
+
+### Phase 5: filesystem and network activity
+
+- Real `openat` capture with raw path, flags, dirfd, result, success, errno, and truncation and relative-path flags.
+- Real IPv4/IPv6 `connect` attempt capture with family, addresses, ports, and raw result.
+- Wire schema v3 and additive SQLite migration 4.
+- CLI `files` and `connections`.
+- Activity verification and deterministic export.
+
+Privileged proof: 72-event and 315-event sessions, including IPv4 and IPv6 attempts; both verified valid with zero findings.
+
+### Phase 6: behavioral analysis
+
+- `syscall-analysis` with deterministic rules A–F.
+- Findings linked to event IDs, process instances, time ranges, limitations, and next steps.
+- Rule, severity, and confidence filters.
+- Strict JSON configuration.
+- `syscall-analysis/v1` output and export integration.
+
+Offline tests cover positive and negative behavior, ambiguity, incomplete evidence, disabled rules, deterministic output, and read-only access. No privileged live validation is claimed for the rule engine.
+
+### Phase 7: desktop workbench
+
+- Tauri 2 + React 19 read-only workbench.
+- Overview, session browser, summary, processes, timeline, filesystem, network, analysis, verification, and export.
+- Typed IPC contract and fixed backend paths.
+- Real-SQLite service tests and renderer tests.
+- Release build and WSLg launch.
+
+## Next: close the privileged evidence gap
+
+- Run the privileged e2e on a native Linux host.
+- Add stress cases for ring-buffer and channel loss.
+- Add a crash-injection case that leaves a `recording` session and verifies read-only inspection.
+- Add an explicit follow or stop policy for detached descendants.
+- Add a privileged CI lane with explicit provisioning and no password prompts.
+
+## Later: scope, scale, and operations
+
+- Optional kernel-side cgroup or PID filtering while preserving documented target-tree semantics.
+- Compare kernel filtering against userspace attribution.
+- Multi-session retention, vacuum, export, and database size limits.
+- Backpressure metrics and alerts for sustained drops.
+- Release packaging and capability-based installation guidance.
+- Structured JSON logs for recorder diagnostics.
+- A schema migration matrix with upgrade and downgrade tests.
+- Additional export formats for downstream analysis.
+- Tamper-evident storage through a hash chain or external signing if the threat model requires it.
+- Per-event redaction rules and path allow or deny filters.
+
+## Non-goals
+
+- File contents, memory, keystrokes, or network payload capture.
+- Hiding the system-wide nature of tracepoints.
+- Automatic privilege escalation or password handling.
+- Claiming kernel coverage from userspace tests or synthetic fixtures.
+- Treating behavioral findings as verdicts.
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="Testing" icon="flask-conical" href="/project/testing">
+    Current validation status and test-layer boundaries.
+  </Card>
+  <Card title="Limitations" icon="triangle-alert" href="/operations/limitations">
+    Limits that remain in the current revision.
+  </Card>
+  <Card title="Development" icon="code" href="/project/development">
+    Build, eBPF, privileged testing, and change procedures.
+  </Card>
+  <Card title="Architecture" icon="boxes" href="/project/architecture">
+    Crate boundaries and design tradeoffs.
+  </Card>
+</CardGroup>

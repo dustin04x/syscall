@@ -1,0 +1,139 @@
+---
+title: "Quickstart"
+description: "Build SYSCALL, record a short target tree, and inspect the resulting evidence."
+---
+
+This path takes you from a source checkout to an inspected, verified, and exported session. It assumes a Linux host with the build prerequisites already installed; see [Installation](/installation) for package commands and host checks.
+
+## Before you begin
+
+- Linux x86_64 with BPF, BTF, tracefs, and ring-buffer support. Kernel 5.8 or later is typical.
+- Rust 1.82 or later, `clang`, libbpf headers and library, and `pkg-config`.
+- Root or `CAP_BPF` + `CAP_PERFMON` for `record` only. Everything else runs unprivileged.
+- Node.js 20 or later only if you want the desktop workbench.
+
+## Build and check the host
+
+<Steps>
+  <Step title="Build the CLI">
+    ```bash
+    cargo build --release -p syscall-cli
+    ```
+
+    The binary is `target/release/syscall`. Building the whole workspace also compiles the desktop crate and requires the [desktop packages](/guides/workbench#build-the-workbench).
+  </Step>
+
+  <Step title="Inspect readiness">
+    ```bash
+    target/release/syscall info
+    target/release/syscall info --json
+    ```
+
+    `info` reports the kernel, BTF availability, tracefs visibility, effective capabilities, and the selected database path. It does not load BPF or change the host.
+  </Step>
+
+  <Step title="Record a target">
+    ```bash
+    sudo target/release/syscall record -- /bin/sh -c 'cat /etc/hostname >/dev/null; (exec 3<>/dev/tcp/127.0.0.1/1) || true'
+    ```
+
+    Recording requires privilege. SYSCALL attaches the programs, drops back to the invoking user, creates the database, and runs the target in its own process group. It never prompts for a password or stores credentials.
+
+    Without `--db`, the database is the invoking user's default data path, normally `~/.local/share/syscall/syscall.db`.
+  </Step>
+</Steps>
+
+The command exits with the target's exit code when recording succeeds. A refused connection is an expected failed `connect` attempt, not a recorder failure.
+
+## Inspect the session
+
+```bash
+target/release/syscall sessions
+target/release/syscall inspect <SESSION_ID>
+target/release/syscall timeline <SESSION_ID> --limit 50
+target/release/syscall files <SESSION_ID>
+target/release/syscall connections <SESSION_ID>
+```
+
+`inspect` summarizes the session, collection accounting, event counts, and observed processes. Use the other commands to follow the recorded activity:
+
+```bash
+target/release/syscall processes <SESSION_ID>
+target/release/syscall tree <SESSION_ID>
+target/release/syscall files <SESSION_ID> --result failure
+target/release/syscall connections <SESSION_ID> --result failure --json
+```
+
+Every command accepts `--json` and a global `--db <PATH>` before or after the subcommand:
+
+```bash
+target/release/syscall --db /tmp/syscall.db sessions
+target/release/syscall sessions --db /tmp/syscall.db --json
+```
+
+## Analyze and verify
+
+```bash
+target/release/syscall analyze <SESSION_ID>
+target/release/syscall analyze <SESSION_ID> --severity medium --min-confidence medium
+target/release/syscall verify <SESSION_ID>
+```
+
+Analysis returns deterministic findings tied to recorded event IDs. Verification checks internal consistency and interpretability without modifying the database.
+
+`verify` uses assessment-specific exit codes:
+
+| Exit | Assessment |
+| ---: | --- |
+| `0` | `valid` |
+| `2` | `valid_but_incomplete` or `warning` |
+| `3` | `invalid` |
+| `4` | `unable_to_verify` |
+
+## Export a package
+
+```bash
+target/release/syscall export <SESSION_ID> \
+  --format json \
+  --output ./evidence-<SESSION_ID>.json
+
+target/release/syscall verify-export ./evidence-<SESSION_ID>.json
+```
+
+Export writes a new deterministic JSON package with a SHA-256 manifest and leaves the source database untouched. The output file is created with mode `0600`. An existing file is not replaced without `--force`.
+
+## Open the workbench
+
+Build the desktop application if you have its system packages:
+
+```bash
+cd desktop
+npm install
+npm run tauri:build -- --no-bundle
+cd ..
+```
+
+Then open a recorded database read-only:
+
+```bash
+target/release/syscall-workbench --db="$HOME/.local/share/syscall/syscall.db"
+```
+
+The workbench has no recording control. Record with the CLI, then open the result. See [Workbench](/guides/workbench) for the screen guide and the Tauri security boundary.
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Record safely" icon="shield" href="/guides/record">
+    Privilege, scope, redaction, signals, and exit behavior.
+  </Card>
+  <Card title="Investigate methodically" icon="search" href="/guides/investigate">
+    Move from session overview to processes, timeline, and activity filters.
+  </Card>
+  <Card title="Read the evidence model" icon="book-open" href="/concepts/evidence-model">
+    Understand what the counters and lifecycle states mean.
+  </Card>
+  <Card title="Review limitations" icon="triangle-alert" href="/operations/limitations">
+    Know what the record cannot establish before drawing conclusions.
+  </Card>
+</CardGroup>

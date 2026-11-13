@@ -1,0 +1,112 @@
+---
+title: "Verify evidence"
+description: "Check a session for internal contradictions without modifying the database."
+---
+
+`syscall verify` performs read-only forensic verification of a recorded session. It checks internal consistency and evidence interpretability. It does not repair, migrate, rewrite, checkpoint, normalize, or complete missing evidence.
+
+## Run verification
+
+```bash
+syscall verify <SESSION_ID>
+syscall verify <SESSION_ID> --json
+```
+
+The command opens the database read-only. When a safe read-only open is impossible, it fails with a structured error rather than mutating the database.
+
+## What verification checks
+
+Checks are bounded and use paged reads rather than loading an unbounded event table.
+
+| Area | Checks |
+| --- | --- |
+| Database structure | `PRAGMA integrity_check`, foreign keys, required tables and columns, readable `user_version` |
+| Session state | Existence, known lifecycle status, timestamp order, finalization and recovery metadata |
+| Event scan | Deterministic ordering, duplicate IDs, tie-breaker consistency, row-count reconciliation |
+| Event semantics | Type validity, payload JSON, payload/type agreement, identity and provenance consistency |
+| Activity semantics | File and network result, errno, family, address length, ports, tracepoint, wire schema |
+| Accounting | Persisted rows versus counters, loss, drops, rejections, failures, legacy availability |
+
+Unsupported or future schema versions produce an `unable_to_verify` report with `DB_SCHEMA_UNSUPPORTED` when the version can be read safely. Verification does not query unknown structures or run migrations.
+
+## Assessment meanings
+
+| Assessment | Meaning |
+| --- | --- |
+| `valid` | Internally consistent where checked; no error or critical findings |
+| `valid_but_incomplete` | Consistent where checkable, but evidence is incomplete or limited |
+| `warning` | Notable limitations without hard contradictions |
+| `invalid` | Contradictory, corrupt, or invalid evidence or state |
+| `unable_to_verify` | Required checks could not be completed |
+
+`valid` does not mean collection was complete, the kernel was trustworthy, or the database is authentic. It means the checks that could run found no contradictions.
+
+## Exit codes
+
+| Exit | Assessment |
+| ---: | --- |
+| `0` | `valid` |
+| `2` | `valid_but_incomplete` or `warning` |
+| `3` | `invalid` |
+| `4` | `unable_to_verify` |
+
+Automation should use these codes, not scrape text.
+
+## Finding shape
+
+Each finding has:
+
+- Stable `code`.
+- Severity: `info`, `warning`, `error`, or `critical`.
+- Title and detail.
+- Evidence context.
+- Recommendation.
+
+Finding codes are intended to be stable for automation. Human-readable details may be refined.
+
+## Activity finding codes
+
+| Code | Severity | Meaning |
+| --- | --- | --- |
+| `EVENT_PAYLOAD_TYPE_MISMATCH` | Error | Event type carries the wrong payload variant |
+| `EVENT_ACTIVITY_RESULT_INCONSISTENT` | Error | Success disagrees with the raw result |
+| `EVENT_ACTIVITY_ERRNO_INCONSISTENT` | Error | Successful event has errno, or failed errno differs from `-result` |
+| `EVENT_FILE_TRACEPOINT_INCONSISTENT` | Error | File event did not come from the expected tracepoint |
+| `EVENT_NETWORK_TRACEPOINT_INCONSISTENT` | Error | Network event did not come from the expected tracepoint |
+| `EVENT_ACTIVITY_WIRE_SCHEMA_INCONSISTENT` | Error | Activity event claims a pre-v3 wire schema |
+| `EVENT_FILE_PATH_INVALID` | Error | Path exceeds 256 bytes or contains NUL |
+| `EVENT_FILE_TRUNCATION_INCONSISTENT` | Warning | Truncation flag is set but the path is short |
+| `EVENT_NETWORK_ADDRESS_INVALID` | Error | Address is not valid for the declared family |
+| `EVENT_NETWORK_SOURCE_INCONSISTENT` | Error | Source address and port presence disagree |
+| `EVENT_NETWORK_PORT_INVALID` | Warning | Destination or source port is zero |
+| `EVENT_NETWORK_ESTABLISHED_CLAIM` | Error | Event claims an established connection |
+
+Additional lifecycle, accounting, schema, and scan findings are defined by the verification engine. Treat error and critical findings as contradictions, not as stylistic warnings.
+
+## Bounded reporting
+
+Events are scanned in deterministic batches. Findings are bounded. If a limit is exceeded, the report marks truncation explicitly with findings such as `FINDINGS_TRUNCATED`. A truncated report is limited, not silently complete.
+
+## Verify an export
+
+Export verification is a separate operation:
+
+```bash
+syscall verify-export <PACKAGE>
+syscall verify-export <PACKAGE> --json
+```
+
+It checks the package format, manifest version, duplicate or missing component entries, byte lengths, and SHA-256 hashes. It exits `0` when valid and `1` when invalid.
+
+Legacy v1 packages with a manifest self-entry are reported as warnings. `verify-export` does not prove that the original database was authentic or untampered before export, and it is not a digital signature or chain of custody.
+
+## What verification cannot do
+
+- Prove runtime correctness or that every event was captured.
+- Recover missing events, provenance, or identity.
+- Prove that the kernel or host was uncompromised.
+- Provide adversarial tamper evidence.
+- Prove that a file path resolved to the file ultimately accessed.
+- Turn a connect attempt into an established session.
+
+Use [Limitations](/operations/limitations) when a conclusion depends on a negative result or on completeness.

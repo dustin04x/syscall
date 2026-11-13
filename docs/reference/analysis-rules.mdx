@@ -1,0 +1,239 @@
+---
+title: "Analysis rules"
+description: "Conditions, exclusions, severity, confidence, configuration, and report contract for rules A through F."
+---
+
+Analysis is deterministic and read-only. It scans persisted evidence, links findings to original event row IDs, and never executes recorded commands.
+
+The output schema is `syscall-analysis/v1`.
+
+## Severity
+
+Severity is investigative priority, not probability.
+
+| Level | Meaning |
+| --- | --- |
+| `informational` | Context or an unresolved observation that is not itself evidence of harmful behavior |
+| `low` | Behavior worth noting, commonly benign |
+| `medium` | A stronger indicator that merits review |
+| `high` | Direct behavior with significant investigative weight, such as a successful credential-file open |
+| `critical` | Reserved for future rules with exceptionally strong evidence; no current default rule emits it |
+
+`--severity` is an inclusive minimum.
+
+## Confidence
+
+Confidence describes the directness and quality of the recorded evidence. It is not a calibrated probability.
+
+| Level | Meaning |
+| --- | --- |
+| `high` | Direct evidence, resolved identity and ancestry, complete verified session |
+| `medium` | Direct evidence with loss, ambiguity, truncation, or explicitly temporal correlation |
+| `low` | Missing resolution, indirect correlation, or multiple evidence-quality limitations |
+
+Incomplete evidence downgrades confidence: `high` to `medium`, `medium` to `low`, `low` remains `low`.
+
+## Rules
+
+<AccordionGroup>
+  <Accordion title="Rule A — Shell chain" icon="terminal">
+    **ID:** `SYSCALL-SHELL-CHAIN` · **Version:** 1
+
+    **Conditions**
+
+    1. A process instance executed a known shell basename: `sh`, `bash`, `dash`, `zsh`, `ksh`, `fish`, or `ash`.
+    2. At least two descendants are linked by recorded process-instance ancestry.
+    3. Maximum observed depth below the shell root is at least two.
+
+    **Reports:** root process, descendant count, maximum depth, a recorded chain, relevant exec and fork events, process references, and timeline.
+
+    **Exclusions:** one-child shells and shells whose children do not spawn further processes. Unresolved ancestry is never filled in by name or PID guesswork.
+
+    **False positives:** build systems, package managers, service wrappers, scripts, and interactive shells routinely create chains.
+
+    **Severity and confidence:** low; high only with resolved ancestry and complete verified evidence.
+  </Accordion>
+
+  <Accordion title="Rule B — Temporary execution" icon="file-terminal">
+    **ID:** `SYSCALL-TEMP-EXEC` · **Version:** 1
+
+    **Conditions**
+
+    1. A persisted `process_exec` event has a non-empty executable filename.
+    2. Its lexically normalized absolute path equals a configured temporary directory or is beneath it at a `/` component boundary.
+
+    Default directories: `/tmp`, `/var/tmp`, `/dev/shm`, `/run/shm`.
+
+    **Exclusions:** `/tmpfoo` is not treated as `/tmp`. Relative and empty executable paths are not guessed or resolved. Missing executable paths are reported as a limitation.
+
+    **False positives:** installers, builds, tests, and self-updating tools commonly execute from temporary directories.
+
+    **Severity and confidence:** medium; high with an observed absolute path and complete evidence.
+  </Accordion>
+
+  <Accordion title="Rule C — Sensitive file open" icon="file-lock">
+    **ID:** `SYSCALL-SENSITIVE-OPEN` · **Version:** 1
+
+    **Conditions**
+
+    A `file_open` event matches a configured sensitive path exactly or beneath it at a component boundary. Successful opens, failed attempts, and unresolved relative paths are grouped separately.
+
+    Default sensitive paths:
+
+    ```text
+    /etc/shadow
+    /etc/gshadow
+    /etc/sudoers
+    /etc/sudoers.d
+    /etc/pam.d
+    /etc/ssh/ssh_host_rsa_key
+    /etc/ssh/ssh_host_ecdsa_key
+    /etc/ssh/ssh_host_ed25519_key
+    /root/.ssh
+    ```
+
+    A relative path is reported only when its basename equals a configured sensitive entry basename, and is informational.
+
+    **Exclusions:** an open event does not prove that contents were read or written. Relative paths cannot be resolved without the process working directory and dirfd.
+
+    **False positives:** authentication, backup, configuration-management, and monitoring software legitimately accesses credential files.
+
+    **Severity and confidence:** successful credential-store opens are high; other successful sensitive opens are medium; failed attempts are low; unresolved relative paths are informational. Direct absolute-path findings can be high confidence; failed attempts are medium; unresolved relative paths are low.
+  </Accordion>
+
+  <Accordion title="Rule D — Repeated failed connect" icon="refresh-cw">
+    **ID:** `SYSCALL-REPEATED-CONNECT` · **Version:** 1
+
+    **Conditions**
+
+    1. At least `repeated_connection_threshold` failed `network_connect` events (default 3) share process instance, address family, destination address, destination port, and raw result.
+    2. All attempts fit within `correlation_window_ns` (default 60 seconds).
+
+    **Exclusions:** a single failed connection is not reported. Successful connects are not counted as failures.
+
+    **False positives:** retry loops, unavailable local services, and scanners can produce repeated refusals.
+
+    **Severity and confidence:** medium; high when the session is complete.
+  </Accordion>
+
+  <Accordion title="Rule E — File and network timing" icon="arrow-left-right">
+    **ID:** `SYSCALL-FS-NET-CORRELATION` · **Version:** 1
+
+    **Conditions**
+
+    A `file_open` event precedes a `network_connect` event in persisted chronological order, within `correlation_window_ns` (default 60 seconds). Same-process and process-tree correlation are separate and labeled.
+
+    Process-tree correlation requires unambiguous ancestry. Ambiguous PID-reuse links are not invented.
+
+    **Exclusions:** the rule never claims that a file was transmitted, that data was exfiltrated, or that the connection carried file contents. Temporal proximity does not prove causation.
+
+    **False positives:** applications routinely open configuration or library files before network requests.
+
+    **Severity and confidence:** low; medium for direct same-process timing, low for tree-relative timing, further reduced for incomplete evidence.
+  </Accordion>
+
+  <Accordion title="Rule F — Short-lived network process" icon="timer">
+    **ID:** `SYSCALL-SHORT-LIVED-NET` · **Version:** 1
+
+    **Conditions**
+
+    1. Recorded `process_exec`, `network_connect`, and `process_exit` events exist for the same process instance.
+    2. The connection occurred after exec and before exit.
+    3. Exec-to-exit duration is at or below `short_lived_window_ns` (default 10 seconds).
+
+    **Exclusions:** processes without a recorded exit are not classified; the report records how many were skipped. Short lifetime alone is never suspicious.
+
+    **False positives:** CLI tools, health checks, package operations, and one-shot network utilities are naturally short-lived.
+
+    **Severity and confidence:** low; medium when all three event types are recorded; lower for incomplete evidence.
+  </Accordion>
+</AccordionGroup>
+
+## Report shape
+
+Each finding includes:
+
+| Field | Meaning |
+| --- | --- |
+| `finding_id` | Deterministic for the same rule, evidence, and primary identity key |
+| `rule_id`, `rule_version` | Rule provenance |
+| `severity`, `confidence` | Investigative labels |
+| `title`, `explanation`, `significance` | Human-readable reasoning |
+| `event_ids` | Original persisted event row IDs |
+| `supporting_events` | Event details in chronological order |
+| `process_instance_ids`, `pids` | Related process identity |
+| `related_processes` | Process-instance references |
+| `time_range` | Inclusive event timestamps |
+| `related_findings` | Reserved for cross-finding links |
+| `limitations` | Finding-specific evidence limits |
+| `next_steps` | Recommended investigative actions |
+| `correlation` | `same_process`, `process_tree`, or `independent` |
+
+The report also contains the session summary, evidence completeness, evaluated rule metadata, report-level limitations, and a `truncated` flag.
+
+Reports are sorted by severity, confidence, start time, rule ID, and finding ID for deterministic output.
+
+## Evidence status
+
+`evidence.status` is `complete` only when:
+
+- Session status is `completed`.
+- Counters show no loss, drops, recovery, or incomplete identity.
+- The event scan was not truncated by `max_events`.
+- Read-only verification completed with assessment `valid`.
+
+Otherwise the status is `incomplete`, and the reasons appear in `evidence.notes` and report limitations.
+
+## Configuration
+
+`--config` loads strict JSON. Unknown fields are rejected. Paths must be absolute and are lexically normalized. Duplicate normalized paths and duplicate disabled rules are rejected. Empty path lists, zero thresholds, zero windows, root `/` entries, and unknown rule IDs are errors.
+
+```json
+{
+  "sensitive_paths": [
+    "/etc/shadow",
+    "/etc/gshadow",
+    "/etc/sudoers",
+    "/etc/sudoers.d",
+    "/etc/pam.d",
+    "/etc/ssh/ssh_host_rsa_key",
+    "/etc/ssh/ssh_host_ecdsa_key",
+    "/etc/ssh/ssh_host_ed25519_key",
+    "/root/.ssh"
+  ],
+  "temporary_directories": ["/tmp", "/var/tmp", "/dev/shm", "/run/shm"],
+  "repeated_connection_threshold": 3,
+  "correlation_window_ns": 60000000000,
+  "short_lived_window_ns": 10000000000,
+  "disabled_rules": [],
+  "max_findings": 1000,
+  "max_events": 100000
+}
+```
+
+`disabled_rules` accepts rule IDs. Disabled rules are skipped by default; an explicit `--rule RULE_ID` overrides the disabled default while still applying bounds.
+
+## Bounds
+
+| Bound | Default or limit |
+| --- | ---: |
+| Events scanned | 100,000 |
+| Findings | 1,000 |
+| Shell descendants traversed | 1,000 |
+| Process-tree correlation pairs | 200 |
+| Supporting events per finding | Engine-capped |
+
+Rule D uses a sliding window rather than unbounded pairwise comparison. Rule F groups events by process instance once rather than rescanning the event list per process.
+
+## Known limitations
+
+- Rules are contextual indicators, not verdicts.
+- An open is not a read; a connect is not an established session.
+- No file contents or network payloads exist in the evidence.
+- Relative paths cannot be resolved.
+- Missing events and losses are never reconstructed.
+- `related_findings` is reserved; no cross-finding inference is performed.
+- No privileged live validation is claimed for the offline analysis engine.
+- Analysis does not prove database authenticity.
+
+See [Analyze behavior](/guides/analyze) for the workflow and [Export format](/reference/export-format) for how the report is packaged.

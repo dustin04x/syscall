@@ -1,0 +1,160 @@
+---
+title: "How SYSCALL works"
+description: "Follow one event from a Linux tracepoint through attribution and SQLite to the investigation surfaces."
+---
+
+SYSCALL separates collection, decoding, attribution, storage, and investigation. The kernel side is deliberately small; the evidence logic lives in Rust crates that can be tested without loading BPF.
+
+## Collection path
+
+```text
+sched and syscall tracepoints
+            │
+            ▼
+   fixed-size wire samples
+            │
+            ▼
+    4 MiB BPF ring buffer
+            │
+            ▼
+ strict decoder in userspace
+            │
+            ▼
+ scope and identity attribution
+            │
+            ▼
+ bounded channel ──► writer thread ──► SQLite
+```
+
+The ring-buffer callback does no disk I/O. It decodes a sample, attributes it, and sends it to a bounded userspace channel. A dedicated writer owns its own SQLite connection and commits batches.
+
+## Tracepoints
+
+Seven stable tracepoints are attached:
+
+| Group | Tracepoint | Purpose |
+| --- | --- | --- |
+| Lifecycle | `sched/sched_process_exec` | Process image execution |
+| Lifecycle | `sched/sched_process_fork` | Process or thread creation |
+| Lifecycle | `sched/sched_process_exit` | Process exit |
+| Filesystem | `syscalls/sys_enter_openat` | Capture open arguments |
+| Filesystem | `syscalls/sys_exit_openat` | Emit the attempt with its result |
+| Network | `syscalls/sys_enter_connect` | Capture connect arguments |
+| Network | `syscalls/sys_exit_connect` | Emit IPv4/IPv6 attempts with their result |
+
+The syscall hooks are paired in bounded LRU maps keyed by the current task. Enter stores the arguments; exit looks up and removes the entry. One attempt produces at most one event. A missing enter, an eviction, or a malformed sample produces no event rather than a fabricated one.
+
+The programs use fixed local structs instead of `vmlinux.h` and CO-RE. Context sizes and offsets are verified by static assertions and by the running kernel's BTF. This trades portability for a small, inspectable kernel surface.
+
+## Wire format and decoding
+
+Samples carry a 56-byte header with magic, wire schema version, event type, monotonic timestamp, PID/TGID, UID/GID, command name, payload length, and the observer-namespace TGID when known.
+
+The Rust decoder treats every sample as untrusted:
+
+- It checks magic, schema version, event type, and minimum size.
+- It checks payload length and payload-end bounds.
+- It checks NUL termination and field-specific address or path rules.
+- It counts and discards malformed samples; a bad sample cannot terminate the session.
+
+Process lifecycle samples from wire versions 1 and 2 remain decodable. File-open and network-connect samples require wire version 3.
+
+The full layout is in [Event and storage schema](/reference/schemas).
+
+## Recording phases
+
+`record` executes in ordered phases so privilege is held only for loading and attaching:
+
+1. Validate the request, target command, scope, and optional session ID.
+2. Inspect effective privilege, `unprivileged_bpf_disabled`, BTF, and tracefs.
+3. Load and attach the BPF skeleton while root or capable.
+4. Drop to the invoking user when launched through sudo; set `umask 077`.
+5. Create the session row as the invoking user.
+6. Spawn the target in its own process group.
+7. Register the root PID with the scope tracker.
+8. Poll the ring buffer, decode, attribute, and enqueue.
+9. On target exit or signal, drain, read loss counters, join the writer, and finalize the session.
+
+A session row exists before the target starts. A normal unwind marks it `failed` with a finalization error. A hard crash leaves it in `recording`, but already-committed data remains readable.
+
+## Scope and attribution
+
+The tracepoints are system-wide. There is no kernel-side PID or cgroup filter. `RecordingScope` describes userspace admission:
+
+- `target-tree`: admit the launched target and descendants.
+- `system`: admit every collected event observed on the host.
+
+For target-tree scope, attribution requires a tracked parent, a matching process instance, and lineage or a verified `/proc` ancestry path. A numeric PID match alone is not enough. Out-of-scope events are counted as filtered, not silently discarded.
+
+The detailed identity and ancestry rules are in [Identity and scope](/concepts/identity-and-scope).
+
+## Storage and concurrency
+
+SQLite is opened with:
+
+```text
+journal_mode=WAL
+synchronous=NORMAL
+foreign_keys=ON
+busy_timeout=5000
+trusted_schema=OFF
+```
+
+The writer batches up to 256 events or 200 ms of activity and commits each batch in one transaction. If a later batch fails, the writer reports the committed count and the error separately so partial evidence remains accounted for.
+
+Inspection commands open the database read-only and verify the schema version before querying. All values are bound parameters.
+
+## Clocks
+
+Kernel events carry `bpf_ktime_get_ns()`, which is monotonic time since boot. At session start the collector captures:
+
+```text
+wall_offset_ns = CLOCK_REALTIME - CLOCK_MONOTONIC
+```
+
+Each event stores both the derived wall-clock timestamp and the raw monotonic timestamp. Prefer `monotonic_ns` for ordering and correlation because a later NTP step can move the wall clock.
+
+## Failure behavior
+
+| Failure | Behavior |
+| --- | --- |
+| No BPF privilege | Explicit refusal; no partial session |
+| Skeleton load or attach failure | Explicit phase error; no recording |
+| Malformed ring sample | Counted and discarded; session continues |
+| Out-of-scope event | Counted as filtered; session continues |
+| Userspace channel full | Counted as a userspace drop; session continues |
+| Ring-buffer output failure | eBPF counter read at finalization and persisted |
+| Writer or SQLite failure | Session marked `failed`; committed rows remain and are reported |
+| Target exits | Drain window of 750 ms, then finalize |
+| Ctrl+C or SIGTERM | Mark interrupted, signal the target group, drain, exit with the signal code |
+| Recorder panic or unwind | Finalization guard marks the session `failed` |
+| Hard crash | Session remains `recording` and is inspectable read-only |
+| PID reuse | Distinct process-instance identity; no inherited trust |
+| Missing syscall pair | No activity event; not separately counted |
+
+## Analysis and verification
+
+Behavioral analysis and verification are offline. They read persisted evidence through bounded storage APIs and never execute recorded commands.
+
+- Analysis rules live in `syscall-analysis` and produce findings that reference original event row IDs.
+- Verification checks structural, relational, lifecycle, ordering, and accounting consistency.
+- Export assembles session, processes, events, analysis, verification, and a component manifest.
+
+The desktop workbench calls the same engines through a narrow Tauri command boundary. It does not contain SQL or duplicate rule logic.
+
+## Continue reading
+
+<CardGroup cols={2}>
+  <Card title="Identity and scope" icon="fingerprint" href="/concepts/identity-and-scope">
+    How process instances, PID reuse, and target-tree admission work.
+  </Card>
+  <Card title="Evidence model" icon="database" href="/concepts/evidence-model">
+    Sessions, events, counters, and what completeness means.
+  </Card>
+  <Card title="Architecture" icon="boxes" href="/project/architecture">
+    Crate boundaries, concurrency, and design tradeoffs.
+  </Card>
+  <Card title="Limitations" icon="triangle-alert" href="/operations/limitations">
+    The evidence gaps that remain by design.
+  </Card>
+</CardGroup>

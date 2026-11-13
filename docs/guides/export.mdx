@@ -1,0 +1,139 @@
+---
+title: "Export evidence"
+description: "Produce a deterministic JSON package with a SHA-256 component manifest and verify it read-only."
+---
+
+`syscall export` creates a portable evidence package for one session. It reads the source database read-only and writes a new file atomically.
+
+## Export a session
+
+```bash
+syscall export <SESSION_ID> \
+  --format json \
+  --output ./evidence-<SESSION_ID>.json
+```
+
+Options:
+
+| Option | Required | Meaning |
+| --- | --- | --- |
+| `--format json` | Yes; default | Current supported format |
+| `--output FILE` | Yes | Destination path |
+| `--force` | No | Replace an existing file |
+| `--json` | No | Emit the export result as JSON |
+
+The destination directory must already exist. The package is written atomically through a temporary file in that directory, fsynced, and renamed. It is created with mode `0600`. Export refuses to overwrite an existing file unless `--force` is explicit.
+
+## Package contents
+
+| Component | Contents |
+| --- | --- |
+| `metadata` | Export time, source database path, session ID, version/build information, limitations |
+| `session` | Recorded session metadata and counters |
+| `process_instances` | Process-instance evidence in stable order |
+| `events` | All recorded events in stable order |
+| `analysis` | `syscall-analysis/v1` report, or an explicit `analysis_failed` component |
+| `verification` | Read-only verification report, with its timestamp normalized for repeatability |
+| `manifest` | SHA-256 entries for the evidence components |
+
+`export_format_version` is currently `syscall-export/v2`.
+
+Only the requested session is included. Unrelated sessions are excluded. No file contents, packet payloads, DNS names, or environment variables are present.
+
+## Determinism
+
+For identical recorded evidence:
+
+- Components are serialized with stable key ordering and stable event and process ordering.
+- Analysis is deterministic for the default export configuration.
+- The embedded verification timestamp is normalized to `0`.
+- `metadata.export_timestamp_ns` is the only value expected to change between exports of the same evidence.
+
+This determinism is useful for comparison, but it does not make the source database authentic.
+
+## Integrity manifest
+
+The manifest contains:
+
+- `manifest_version`: currently `2`.
+- `hash_algorithm`: `sha256`.
+- `entries`: component name, component version, lowercase SHA-256 digest, byte length.
+- `note`: the integrity semantics.
+
+Components are hashed as:
+
+```text
+serde_json::to_string_pretty(component) + "\n"
+```
+
+The manifest does not hash itself. That avoids a circular definition.
+
+Verify a package without modifying it:
+
+```bash
+syscall verify-export ./evidence-<SESSION_ID>.json
+syscall verify-export ./evidence-<SESSION_ID>.json --json
+```
+
+The verifier checks format, manifest version, duplicate or missing entries, byte lengths, and hashes. It exits `0` when valid and `1` when invalid.
+
+<Warning>
+The manifest provides post-export integrity checking. It does not prove that the original database was authentic or untampered before export. It is not a digital signature and does not establish chain of custody.
+</Warning>
+
+## Analysis failure
+
+Analysis is a required component. If it cannot complete during export, the package includes:
+
+```json
+{
+  "status": "analysis_failed",
+  "error": "...",
+  "findings": []
+}
+```
+
+A limitation is recorded in the package metadata. The component is never silently omitted.
+
+## Privacy and redaction
+
+Session arguments are exported as recorded.
+
+- If `--redact-args` was used, redacted placeholders are preserved and original values are absent.
+- File paths can reveal sensitive names and directory structure.
+- Network events reveal destination addresses and ports.
+- There are no file contents, packet payloads, DNS names, or environment variables.
+- Activity limitations remain in the record: paths may be relative or truncated, source addresses may be null, and connect events are attempts.
+
+Treat the package as sensitive evidence.
+
+## Verify an exported package
+
+```bash
+syscall verify-export ./evidence-<SESSION_ID>.json
+```
+
+Use `--json` for automation. A failed verification means the package changed or was malformed after export; it does not by itself identify who changed it.
+
+## Versioning
+
+`export_format_version` identifies the package structure. `manifest_version` identifies the manifest shape. The analysis component carries its own schema version.
+
+Future changes must increment the relevant version and preserve the ability to interpret prior packages where practical. Legacy v1 packages remain inspectable; their manifest self-entry is reported as a warning.
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="Export format reference" icon="file-json" href="/reference/export-format">
+    Field order, manifest rules, and compatibility details.
+  </Card>
+  <Card title="Verification" icon="shield-check" href="/guides/verify">
+    Session consistency checks and assessment codes.
+  </Card>
+  <Card title="Evidence model" icon="database" href="/concepts/evidence-model">
+    Accounting, completeness, and authenticity boundaries.
+  </Card>
+  <Card title="Security" icon="lock" href="/operations/security">
+    Data handling, permissions, and privilege boundaries.
+  </Card>
+</CardGroup>

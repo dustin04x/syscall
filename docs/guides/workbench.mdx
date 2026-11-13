@@ -1,0 +1,199 @@
+---
+title: "Desktop workbench"
+description: "Open recorded evidence in a read-only investigation surface built with Tauri 2 and React."
+---
+
+The workbench is a read-only desktop investigation surface over the existing SQLite evidence store. It does not create synthetic sessions, run analysis with different rules, or record activity.
+
+Recording remains a CLI/operator responsibility. The workbench reports `recording_supported: false` and has no record button.
+
+## Build the workbench
+
+Install the [desktop prerequisites](/installation#install-build-dependencies), then:
+
+```bash
+cd desktop
+npm install
+npm run tauri:dev
+```
+
+Development mode starts Vite on `127.0.0.1:1420` and launches the Tauri window.
+
+Build a release binary without an installer:
+
+```bash
+cd desktop
+npm run tauri:build -- --no-bundle
+cd ..
+```
+
+The binary is `target/release/syscall-workbench`.
+
+## Open a database
+
+The database path is fixed when the application starts:
+
+```bash
+target/release/syscall-workbench --db="$HOME/.local/share/syscall/syscall.db"
+```
+
+Alternatives:
+
+```bash
+target/release/syscall-workbench --db "$HOME/.local/share/syscall/syscall.db"
+SYSCALL_DB="$HOME/.local/share/syscall/syscall.db" target/release/syscall-workbench
+```
+
+The frontend cannot supply or change a database path.
+
+The database must already exist and must use a supported schema. Read-only open does not migrate it.
+
+## Screens
+
+### Overview
+
+Evidence posture, recent sessions, integrity distribution, latest verification, and the read-only boundary.
+
+![Overview](/screenshots/overview.png)
+
+### Sessions
+
+Searchable, sortable session browser with status, scope, loss, verification, and finding counts. Results are bounded and report the matched count.
+
+![Session browser](/screenshots/sessions.png)
+
+### Investigation summary
+
+Session identity, collection accounting, evidence composition, verification, and a behavioral finding preview.
+
+![Investigation summary](/screenshots/investigation-summary.png)
+
+### Processes
+
+Observed process tree with explicit unresolved ancestry and identity markers. Selecting a node shows instance identity, lifetime, exit status, relationships, and provenance notes.
+
+![Processes](/screenshots/processes.png)
+
+### Timeline
+
+Paged event timeline with type, process, path or address search, time bounds, and an event dossier containing the recorded payload and provenance.
+
+![Timeline](/screenshots/timeline.png)
+
+### Filesystem
+
+`openat` attempts with absolute or relative path form, flags, result, errno, and attempt semantics. Relative paths are shown as recorded.
+
+![Filesystem](/screenshots/filesystem.png)
+
+### Network
+
+IPv4/IPv6 `connect` attempts. The screen states that a successful connect does not prove an established session, data transfer, or reachability.
+
+![Network](/screenshots/network.png)
+
+### Behavioral analysis
+
+Deterministic findings with severity, confidence, rule filters, supporting event links, related processes, next steps, limitations, and rule metadata.
+
+![Behavioral analysis](/screenshots/analysis.png)
+
+### Verification
+
+Verification assessment, findings, severity distribution, and interpretation. Verification checks the stored record; it does not prove that collection was complete.
+
+![Verification](/screenshots/verification.png)
+
+### Export
+
+The destination is selected by the Rust backend. Existing files require explicit confirmation before replacement, and the result displays the component manifest.
+
+![Evidence export](/screenshots/export.png)
+
+![Export result](/screenshots/export-result.png)
+
+The screenshots above use the standalone renderer's deterministic preview dataset and label the contract as `ui-preview`. They document the interface, not live-recorded evidence.
+
+## Interface semantics
+
+| Display | Meaning |
+| --- | --- |
+| **Filtered by scope** | Out-of-scope events rejected in target-tree mode; not collection loss |
+| **Evidence loss** | Ring-buffer or userspace drops, malformed samples, or persistence failures |
+| **Unresolved identity** | Canonical identity could not be fully established |
+| **Unresolved ancestry** | Parent linkage is ambiguous or missing |
+| **Valid** | Verification found no contradictions where it could check |
+| **Incomplete** | Evidence is limited even if the record is internally consistent |
+| **Connect attempt** | A recorded `connect` syscall; never promoted to an established session |
+
+Counts represent persisted rows. An empty category means no matching event was recorded, not that the activity did not occur.
+
+## Desktop command contract
+
+Contract version: `syscall-desktop/v2`. All request fields are camelCase. Database and analysis work run on a blocking worker.
+
+| Command | Request | Response |
+| --- | --- | --- |
+| `app_info` | None | Contract version, database path and existence, read-only flag, export directory, recording support |
+| `list_sessions` | `limit`, `search`, `status`, `sortBy`, `sortDirection`, `includeIntelligence` | Session list |
+| `get_overview` | `recentLimit` | Evidence overview |
+| `get_session` | `sessionId` | Session detail and stats |
+| `list_processes` | `sessionId` | Process tree |
+| `query_timeline` | `sessionId`, `eventType`, `pid`, `processInstanceId`, `fromNs`, `toNs`, `search`, `limit`, `offset` | Timeline page |
+| `query_filesystem` | `sessionId`, `pid`, `processInstanceId`, `fromNs`, `toNs`, `success`, `search`, `limit`, `offset` | File activity page |
+| `query_network` | Filesystem request plus `family` | Connection page |
+| `get_event` | `sessionId`, `eventId` | Event detail |
+| `run_analysis` | `sessionId` | Existing analysis report |
+| `run_verification` | `sessionId` | Existing verification report |
+| `export_session` | `sessionId`, `force` | Export path, bytes, format, manifest |
+
+Bounds and validation:
+
+- Session list is capped at 500; page size is capped at 500; recent overview at 20.
+- Search strings are limited to 200 characters.
+- Session IDs reject empty values, `.`, `..`, path separators, and overlong values.
+- Status, sort, direction, and address family are normalized against fixed sets.
+- `get_event` requires both a session ID and an event ID; a mismatched session returns no event.
+- Errors are structured as `{ code, message }`, including `SESSION_NOT_FOUND`, `DATABASE_NOT_FOUND`, `INVALID_REQUEST`, `STORAGE_ERROR`, `ANALYSIS_ERROR`, and `EXPORT_ERROR`.
+
+## Security boundary
+
+- The database is opened with `Storage::open_read_only`; the workbench never inserts, updates, migrates, vacuums, or deletes evidence.
+- `src/lib/api.ts` is the only source module that imports the Tauri core API.
+- The capability grants only `core:default` to the main window.
+- The CSP restricts scripts, styles, images, fonts, frames, and connections to the application and Tauri IPC.
+- No SQL, shell, filesystem, dialog, or HTTP plugin is exposed.
+- Untrusted event strings render as React text. There is no `dangerouslySetInnerHTML`.
+- Export writes to `~/.local/share/syscall/exports/<session-id>.json` or `SYSCALL_EXPORT_DIR`. The frontend cannot choose a path.
+- Export creates the directory with mode `0700` and the package with mode `0600`.
+
+### Why there is no record button
+
+Recording needs privileged BPF. A GUI record button would require one of:
+
+1. Running the whole window as root, expanding the attack surface.
+2. Embedding or caching sudo credentials, which the project forbids.
+3. A separate privileged helper with authenticated, narrow IPC.
+
+The current design has none of these. Record with the CLI and open the result read-only.
+
+## WSLg
+
+If the window is blank under WSLg, disable WebKit compositing:
+
+```bash
+WEBKIT_DISABLE_COMPOSITING_MODE=1 target/release/syscall-workbench --db=...
+```
+
+See [WSL2 compatibility](/operations/wsl) for observed behavior.
+
+## Limitations
+
+- No automatic migration for old databases.
+- No signed installer or packaged bundle in this revision.
+- Export destination is fixed by the backend.
+- No OS-level sandbox around the renderer beyond Tauri capabilities and CSP.
+- Large sessions are paged, but the table is not fully virtualized.
+- No automated GUI end-to-end test; the renderer has component tests and the service layer has real-SQLite tests.
+
+For the build and validation record, see [Testing](/project/testing).

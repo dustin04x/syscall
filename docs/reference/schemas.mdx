@@ -1,0 +1,260 @@
+---
+title: "Event and storage schema"
+description: "Wire format, domain payloads, validation rules, and SQLite schema versions."
+---
+
+Three contracts are versioned independently. A newer value is rejected explicitly rather than interpreted optimistically.
+
+| Contract | Current version | Enforced by |
+| --- | ---: | --- |
+| Ring-buffer wire format | `3` | eBPF layout checks and strict Rust decoding |
+| Domain event schema | `2` | `Event::validate`, JSON payloads, storage rows |
+| SQLite schema | `5` | Storage migrations and `PRAGMA user_version` |
+
+The wire decoder accepts versions 1 and 2 for process lifecycle samples. File-open and network-connect samples require wire version 3.
+
+## Ring-buffer wire format
+
+All multi-byte fields are native-endian because producer and consumer are on the same host. Structures are 8-byte aligned.
+
+### Header
+
+56 bytes:
+
+| Offset | Size | Type | Field | Meaning |
+| ---: | ---: | --- | --- | --- |
+| 0 | 4 | `u32` | `magic` | `0x5343594c` (`SYCL`) |
+| 4 | 2 | `u16` | `schema_version` | Wire version |
+| 6 | 2 | `u16` | `event_type` | 1 exec, 2 fork, 3 exit, 4 file-open, 5 network-connect |
+| 8 | 8 | `u64` | `timestamp_ns` | Raw `bpf_ktime_get_ns()` |
+| 16 | 4 | `u32` | `pid` | Task ID in the BPF context |
+| 20 | 4 | `u32` | `tgid` | Thread-group ID in the BPF context |
+| 24 | 4 | `u32` | `uid` | Current UID |
+| 28 | 4 | `u32` | `gid` | Current GID |
+| 32 | 16 | `char[16]` | `comm` | NUL-terminated or truncated command name |
+| 48 | 4 | `u32` | `data_len` | Payload length excluding trailing NUL where applicable |
+| 52 | 4 | `u32` / `i32` | `ns_tgid` | Observer-namespace TGID when known; `0` when unavailable |
+
+Wire v1 treated `ns_tgid` as reserved and zero.
+
+### Exec sample
+
+320 bytes:
+
+| Offset | Size | Type | Field |
+| ---: | ---: | --- | --- |
+| 0 | 56 | header | `hdr` |
+| 56 | 4 | `s32` | `old_pid` |
+| 60 | 256 | `char[256]` | `filename` |
+
+`data_len` is the filename length excluding NUL. The decoder requires `data_len <= 256`, a NUL at `60 + data_len` when non-empty, and a sample of at least 320 bytes.
+
+### Fork sample
+
+96 bytes:
+
+| Offset | Size | Type | Field |
+| ---: | ---: | --- | --- |
+| 0 | 56 | header | `hdr` |
+| 56 | 4 | `u32` | `parent_pid` |
+| 60 | 4 | `u32` | `child_pid` |
+| 64 | 16 | `char[16]` | `parent_comm` |
+| 80 | 16 | `char[16]` | `child_comm` |
+
+The header PID and TGID are both the child PID. Userspace checks `/proc/<child>/status` to reject thread-creation events when the child is not a process leader.
+
+### Exit sample
+
+64 bytes:
+
+| Offset | Size | Type | Field |
+| ---: | ---: | --- | --- |
+| 0 | 56 | header | `hdr` |
+| 56 | 4 | `s32` | `exit_priority` |
+
+### File-open sample
+
+336 bytes, emitted at `syscalls/sys_exit_openat` after a matching enter:
+
+| Offset | Size | Type | Field |
+| ---: | ---: | --- | --- |
+| 0 | 56 | header | `hdr` |
+| 56 | 8 | `s64` | `result` |
+| 64 | 4 | `s32` | `dirfd` |
+| 68 | 4 | `u32` | `flags` |
+| 72 | 1 | `u8` | `path_is_absolute` |
+| 73 | 1 | `u8` | `path_truncated` |
+| 74 | 6 | `u8[6]` | `_pad` |
+| 80 | 256 | `char[256]` | `path` |
+
+`result` is a non-negative file descriptor on success or a negative errno on failure. `dirfd == -100` is `AT_FDCWD`. The path is the raw string passed to `openat`, not a resolved path.
+
+### Network-connect sample
+
+104 bytes, emitted at `syscalls/sys_exit_connect` after a matching enter, only for `AF_INET` and `AF_INET6`:
+
+| Offset | Size | Type | Field |
+| ---: | ---: | --- | --- |
+| 0 | 56 | header | `hdr` |
+| 56 | 8 | `s64` | `result` |
+| 64 | 2 | `u16` | `family` (`AF_INET` = 2, `AF_INET6` = 10) |
+| 66 | 2 | `u16` | `destination_port` (network byte order) |
+| 68 | 2 | `u16` | `source_port` (network byte order) |
+| 70 | 1 | `u8` | `address_len` |
+| 71 | 1 | `u8` | `source_available` |
+| 72 | 16 | `u8[16]` | `destination_address` |
+| 88 | 16 | `u8[16]` | `source_address` |
+
+IPv4 addresses occupy the first four bytes and are zero-padded. The decoder validates family, address length, padding, and port conversion. `source_available == 0` stores source address and port as `null`, not a guess.
+
+## Domain event
+
+```json
+{
+  "id": 42,
+  "session_id": "s-1762632000000-0123456789abcdef",
+  "schema_version": 2,
+  "event_type": "process_exec",
+  "timestamp_ns": 1762632001000000000,
+  "monotonic_ns": 123456789,
+  "pid": 4242,
+  "tid": 4242,
+  "uid": 1000,
+  "gid": 1000,
+  "ppid": 1,
+  "comm": "sleep",
+  "process_instance_id": "3f2a...:4242:987654",
+  "payload": {
+    "kind": "process_exec",
+    "filename": "/usr/bin/sleep",
+    "ppid": 1,
+    "start_time_ticks": 987654,
+    "old_pid": 4200
+  }
+}
+```
+
+`id` is assigned by SQLite and is null before persistence.
+
+For schema v2, `tid` preserves the observed thread ID for `file_open` and `network_connect`. Lifecycle events keep the process TGID. Schema v1 rows used the process TGID for every event, so consumers must check `schema_version` when reading historical data.
+
+### Payload variants
+
+| `kind` | Fields |
+| --- | --- |
+| `process_exec` | `filename`, `ppid`, `start_time_ticks`, `old_pid` |
+| `process_fork` | `parent_pid`, `parent_tgid`, `child_pid`, `child_comm`, `child_start_time_ticks` |
+| `process_exit` | `ppid`, `start_time_ticks`, `exit_priority` |
+| `file_open` | `path`, `path_is_absolute`, `path_truncated`, `dirfd`, `flags`, `result`, `success`, `errno` |
+| `network_connect` | `family`, `source_address`, `source_port`, `destination_address`, `destination_port`, `result`, `success`, `errno`, `established` |
+
+`file_open.success` is `result >= 0`. `network_connect.success` is `result == 0`. For failures, `errno` is `-result` when representable, otherwise null. `network_connect.established` is always `false`; the hook proves an attempt, not an established connection, and cannot distinguish TCP from UDP.
+
+Exec and exit payloads include flattened `ppid` and `start_time_ticks` from process metadata.
+
+### Validation
+
+`Event::validate` rejects:
+
+- Unknown domain schema versions.
+- Empty or oversized session, process-instance, comm, or filename values.
+- Control characters in IDs.
+- NUL bytes or non-positive PIDs/TIDs.
+- Non-positive timestamps, non-positive wall clock, or zero monotonic time.
+- Event type and payload mismatch.
+- File paths longer than 256 bytes or containing NUL.
+- Invalid address family, address length, or address bytes.
+- Activity success or errno inconsistent with the raw result.
+- A network event claiming `established = true`.
+- Negative `ppid` or `old_pid`.
+- Oversized fork command fields.
+
+Storage validates the complete batch before opening a transaction and checks every event's session ID against the batch.
+
+## SQLite schema version 5
+
+Versions 2 through 5 are additive:
+
+| Version | Change |
+| ---: | --- |
+| 2 | Provenance columns |
+| 3 | Recovery and accounting fields, event ordering support |
+| 4 | Activity-query indexes |
+| 5 | Collector self-filter counter |
+
+Existing sessions remain readable; historical rows are not rewritten.
+
+### sessions
+
+| Column | Type | Notes |
+| --- | --- | --- |
+| `id` | TEXT PK | Session ID |
+| `schema_version` | INTEGER | Domain schema version |
+| `started_at_ns` | INTEGER | Wall clock since Unix epoch |
+| `ended_at_ns` | INTEGER NULL | Wall clock since Unix epoch |
+| `command` | TEXT | Program path |
+| `arguments` | TEXT | JSON array; may contain `"<redacted>"` |
+| `recording_scope` | TEXT | `target-tree` or `system` |
+| `status` | TEXT | `starting`, `recording`, `completed`, `interrupted`, `failed` |
+| `boot_id` | TEXT NULL | Boot identifier |
+| `kernel_release` | TEXT NULL | Kernel release |
+| `collector_version` | TEXT NULL | Collector version |
+| `dropped_events` | INTEGER | Ring-buffer loss plus userspace drops |
+| `ringbuf_lost_events` | INTEGER | eBPF output failures |
+| `userspace_dropped_events` | INTEGER | Bounded-channel drops |
+| `malformed_events` | INTEGER | Decoder rejects |
+| `filtered_events` | INTEGER | Out-of-scope events |
+| `events_received` | INTEGER | Ring samples received |
+| `events_decoded` | INTEGER | Samples decoded |
+| `events_attributed` | INTEGER | Samples attributed |
+| `events_persisted` | INTEGER | Committed rows |
+| `events_rejected_scope` | INTEGER | Scope rejections |
+| `events_rejected_malformed` | INTEGER | Decode or malformed rejections |
+| `events_persist_failed` | INTEGER | Persistence failure indicator |
+| `events_self_filtered` | INTEGER | Collector samples filtered before attribution (v5) |
+| `error` | TEXT NULL | Finalization or writer error |
+
+### events
+
+| Column | Type | Notes |
+| --- | --- | --- |
+| `id` | INTEGER PK AUTOINCREMENT | Query and ordering ID |
+| `session_id` | TEXT FK | `ON DELETE CASCADE` |
+| `schema_version` | INTEGER | Domain schema version |
+| `event_type` | TEXT | One of the five collected types |
+| `timestamp_ns` | INTEGER | Derived wall clock |
+| `monotonic_ns` | INTEGER | Raw kernel timestamp |
+| `pid` | INTEGER | Process or task ID |
+| `tid` | INTEGER | Observed thread ID for v2 activity; process TGID otherwise |
+| `ppid` | INTEGER NULL | Parent PID |
+| `uid` | INTEGER | User ID |
+| `gid` | INTEGER | Group ID |
+| `process_instance_id` | TEXT | PID-reuse-safe identity |
+| `comm` | TEXT | Command name |
+| `payload` | TEXT | JSON payload |
+
+Indexes:
+
+```sql
+idx_events_session_id
+idx_events_timestamp
+idx_events_pid
+idx_events_event_type
+idx_events_session_time
+idx_events_session_type
+idx_events_process_instance
+idx_events_session_type_time
+idx_events_session_instance_time
+```
+
+The last two were added in v4. Activity queries use `json_valid` and `json_extract` for payload fields and order by `timestamp_ns ASC, monotonic_ns ASC, id ASC`.
+
+## Migration policy
+
+- Migrations are ordered by `PRAGMA user_version`.
+- A writable open applies pending migrations in a transaction and bumps the version.
+- A read-only open never migrates.
+- A missing schema or a newer version is rejected.
+- A schema bump requires a new migration file, a `LATEST_SCHEMA_VERSION` update, tests, and a documentation update.
+
+See [Development](/project/development#add-a-schema-migration) for the change procedure.

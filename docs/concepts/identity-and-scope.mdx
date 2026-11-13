@@ -1,0 +1,109 @@
+---
+title: "Identity and scope"
+description: "How SYSCALL distinguishes processes across PID reuse, PID namespaces, forks, and target-tree boundaries."
+---
+
+A PID is not a stable process identity. SYSCALL therefore separates three identity spaces and records the evidence needed to reconcile them.
+
+## Three identity spaces
+
+| Space | Source | Use |
+| --- | --- | --- |
+| **Raw BPF identity** | Kernel-observed IDs in the event header and tracepoint context | Diagnostic provenance; may be expressed in a different PID namespace than the collector. |
+| **Observer-visible identity** | IDs the collector can see in its own `/proc` and PID namespace | Enables correlation with `/proc` metadata. |
+| **Canonical process identity** | The persisted identity used for attribution, relationships, and queries | Stable within a boot and safe against PID reuse. |
+
+When correlation is established, canonical identity equals observer-visible identity. Raw IDs remain available for diagnosis. SYSCALL does not silently substitute one for another.
+
+## Process-instance identity
+
+The canonical ID is:
+
+```text
+boot_id:pid:start_time_ticks
+```
+
+- `boot_id` comes from `/proc/sys/kernel/random/boot_id` and is captured once per session.
+- `pid` is the canonical observer-visible PID.
+- `start_time_ticks` is field 22 of `/proc/<pid>/stat`.
+
+If `/proc` disappears before start time can be read, the fallback is:
+
+```text
+boot_id:pid:unknown-<monotonic_ns>
+```
+
+Fallback identities are visibly marked as unresolved. They still distinguish observations, but they do not establish the same lifetime evidence as a start-time-qualified instance.
+
+## PID reuse
+
+A PID can be reused after a process exits. The scope tracker caches the start time for each tracked instance. If a new observation has the same PID but a different `start_time_ticks`, it is treated as a different process and is not admitted on the old identity's trust.
+
+Process relationships also use process-instance IDs, not PIDs alone. If parent linkage cannot be established unambiguously, SYSCALL reports unresolved ancestry rather than guessing.
+
+## Target-tree admission
+
+Target-tree scope admits the launched target and its descendants. The kernel still observes the whole host; admission happens in userspace.
+
+The tracker applies these rules:
+
+1. The spawned target is registered as the root.
+2. A fork is admitted when its parent is already tracked.
+3. If a fork was lost or arrived out of order, `/proc/<ppid>` ancestry is walked up to 64 levels looking for a tracked ancestor.
+4. Thread-creation events are rejected by checking whether `/proc/<child>/status` has `Tgid == Pid`. The same distinction applies to thread exits.
+5. A PID with a different cached start time is treated as reused and is not admitted without new lineage.
+6. Activity events are attributed only when the observed process resolves to a tracked instance. A numeric PID match is insufficient.
+
+Events that fail admission are counted as **filtered by scope**. They are not evidence loss and are not silently discarded.
+
+## Namespace correlation
+
+On WSL2, rootless hosts, and container hosts, the BPF programs and the collector may not see the same PID numbers. The event header carries `ns_tgid`, the observer/collector PID-namespace TGID when known.
+
+- When `ns_tgid` is available, it correlates the event to the collector's view.
+- When it is unavailable, SYSCALL may use a verified `/proc` fallback only when same-namespace, process-leader evidence matches the tracked canonical parent.
+- Raw BPF IDs remain in the record even after correlation.
+
+Namespace correlation is not a security boundary. It is an attribution mechanism with documented failure modes.
+
+## Fork buffering
+
+The BPF fork handler currently emits child `ns_tgid=0`; the wire layout is unchanged. A raw child TGID may differ from the observer-visible PID across namespaces, so SYSCALL does not invent a canonical child identity.
+
+- If child `ns_tgid` is available, it is used.
+- Otherwise, a verified procfs fallback may be attempted under the same-namespace, process-leader conditions described above.
+- If identity remains unresolved, the fork is registered as **provisional**: lineage is admitted for scope purposes, but the identity is not claimed as resolved.
+- A later child exec or exit with child-context `ns_tgid` upgrades the identity, learns the alias, and flushes the buffered fork before the current event. The flushed fork uses the same canonical process-instance ID and its original timestamps.
+- If correlation never arrives, buffered forks are flushed at session end with explicit provisional identity.
+
+The result is conservative: a child event may wait for identity evidence, but the recorder does not fabricate one.
+
+## System scope
+
+`--scope system` admits every observed event. It does not change the fact that tracepoints are system-wide, and it does not add kernel filtering.
+
+System scope is appropriate for host-level investigation. It can produce substantially more data, including unrelated process activity. The session row records the chosen scope so later readers do not have to infer it.
+
+## Bounds
+
+| Structure | Bound |
+| --- | ---: |
+| Tracked process instances | 65,536 |
+| Syscall pairing maps | 8,192 entries each |
+| Fork buffering and namespace aliases | Separately capped |
+| `/proc` ancestry walk | 64 levels |
+| Process command name | 16 bytes |
+| Executable path | 256 bytes |
+| File-open path | 256 bytes |
+
+When the tracked-process table is full, new processes are filtered and counted. Overflow fork entries are emitted as explicitly unresolved rather than silently dropped. A fork bomb cannot grow userspace memory without bound.
+
+## Reading unresolved evidence
+
+An unresolved flag is an attribution limitation, not proof that an event is corrupt.
+
+- **Unresolved identity** means the canonical process instance could not be fully established.
+- **Unresolved ancestry** means the parent relationship cannot be claimed from recorded evidence.
+- **Provisional fork** means lineage was admitted but the child identity awaited correlation.
+
+Analysis downgrades confidence when these limitations apply. The workbench surfaces them separately from collection loss. Use [Verification](/guides/verify) to check whether the stored record is internally consistent, and [Limitations](/operations/limitations) before drawing negative conclusions.

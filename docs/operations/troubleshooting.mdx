@@ -1,0 +1,238 @@
+---
+title: "Troubleshooting"
+description: "Diagnose host readiness, privilege, BPF, database, capture, export, and desktop failures."
+---
+
+Start with the readiness report and read the exact error. Do not turn a failed privileged check into a pass by weakening host security.
+
+## First commands
+
+```bash
+target/release/syscall info
+target/release/syscall info --json
+```
+
+`info` reports BTF, tracefs, tracepoint visibility, privilege, unprivileged BPF policy, and the selected database. It does not need root.
+
+For collector diagnostics:
+
+```bash
+RUST_LOG=syscall_collector=debug,syscall_storage=debug \
+  sudo target/debug/syscall record -- /usr/bin/sleep 1
+```
+
+Diagnostics go to stderr. JSON data goes to stdout.
+
+## Recording failures
+
+### Insufficient privilege
+
+```text
+insufficient privileges: BPF loading requires effective UID 0 or CAP_BPF+CAP_PERFMON
+```
+
+Use sudo or grant both capabilities:
+
+```bash
+sudo target/release/syscall record -- /usr/bin/sleep 5
+```
+
+If `unprivileged_bpf_disabled` is `2`, an unprivileged load must fail. That is expected.
+
+### Tracepoints unknown or unreadable
+
+If tracefs is `drwx------ root root`, `info` reports tracepoint availability as unknown rather than guessing. Run the recorder with privilege. Do not chmod tracefs to make an unprivileged check pass.
+
+### BPF object build failure
+
+```bash
+make -C ebpf clean check
+```
+
+This isolates clang and libbpf from Cargo. Verify:
+
+- `clang` is installed.
+- libbpf headers and library are installed.
+- `pkg-config --libs libbpf` resolves.
+- The expected seven tracepoint sections are present.
+
+If skeleton generation fails, inspect the Cargo build output for the clang invocation and include paths.
+
+### BTF layout failure
+
+```bash
+scripts/check-btf-layout.sh
+```
+
+If a struct size or field offset differs, do not load the program. Update the context structs, wire offsets, and decoder together. Bump the wire schema if the wire layout changes.
+
+### Target command errors
+
+The command after `--` is executed directly, not through a shell.
+
+```bash
+# Correct
+syscall record -- /bin/sh -c 'echo hello'
+
+# Wrong: shell syntax sent to a non-shell target
+syscall record -- echo hello '&&' sleep 1
+```
+
+A missing target after `--` is rejected.
+
+## Database failures
+
+### Database not found
+
+```bash
+syscall --db /path/to/evidence.db sessions
+```
+
+Use the same `--db` value that was used for recording, or set `SYSCALL_DB`. The default is `~/.local/share/syscall/syscall.db`.
+
+### Schema version unsupported
+
+Read-only commands do not migrate. A database created by a newer schema is rejected explicitly, and a missing schema is not initialized during inspection.
+
+Use a compatible database or record a new session with the current collector. Do not edit `PRAGMA user_version` to bypass the check.
+
+### Session not found
+
+The session ID must match exactly. List available sessions:
+
+```bash
+syscall sessions --limit 200
+```
+
+## Unexpected capture results
+
+### No file or network rows
+
+Check, in order:
+
+1. Was the target in the selected scope?
+2. Did the target perform `openat` or IPv4/IPv6 `connect`?
+3. Is the activity inside the recording window?
+4. Did the session report filtered events, loss, or malformed samples?
+5. Did the target use `open`, `openat2`, `sendto`, `sendmsg`, or another unhooked call?
+
+Absence of rows is not proof of no activity.
+
+### Connect rows exist but do not show an established session
+
+That is expected. `network_connect.established` is always false. The hook records `connect` attempts, not application-level sessions.
+
+### Failed connect to localhost
+
+A refused connection to an unused local port is valid failed-connect evidence. It does not indicate a recorder bug.
+
+### Ring-buffer loss or userspace drops
+
+Inspect the counters:
+
+```bash
+syscall stats <SESSION_ID>
+syscall inspect <SESSION_ID>
+```
+
+If loss is nonzero, the session is incomplete. Reduce load, narrow scope, or collect again. Do not present the session as a complete baseline.
+
+### A session remains `recording`
+
+The recorder likely crashed before finalization. Committed rows remain readable. Treat the session as incomplete and inspect the finalization error if one was recorded.
+
+## Verification failures
+
+`verify` assessment codes:
+
+| Exit | Assessment |
+| ---: | --- |
+| `0` | `valid` |
+| `2` | `valid_but_incomplete` or `warning` |
+| `3` | `invalid` |
+| `4` | `unable_to_verify` |
+
+If verification returns `unable_to_verify`, read the finding codes. `DB_SCHEMA_UNSUPPORTED` means the schema is newer than the binary. A read or scan failure is not a clean result.
+
+Do not repair or rewrite the database to make verification pass. Preserve the original evidence and document the failure.
+
+## Export failures
+
+### Output already exists
+
+Export refuses replacement without confirmation:
+
+```bash
+syscall export <SESSION_ID> --format json --output ./evidence.json --force
+```
+
+Only use `--force` when replacing the file is intentional.
+
+### Destination directory missing
+
+Create the directory first. Export creates the file atomically but does not create an arbitrary parent path.
+
+### Export verification fails
+
+```bash
+syscall verify-export ./evidence.json
+```
+
+A failure means the package changed or was malformed after export. Preserve the original and investigate before overwriting it.
+
+## Desktop failures
+
+### Missing WebKitGTK or GTK development packages
+
+Install the [desktop prerequisites](/installation#install-build-dependencies). Without them, the Tauri GUI cannot compile; the headless service layer can still be tested.
+
+### Wrong binary path
+
+After `npm run tauri:build -- --no-bundle` from `desktop/`, the binary is at the workspace root:
+
+```bash
+../target/release/syscall-workbench --db="$HOME/.local/share/syscall/syscall.db"
+```
+
+From the repository root:
+
+```bash
+target/release/syscall-workbench --db="$HOME/.local/share/syscall/syscall.db"
+```
+
+### Blank window under WSLg
+
+```bash
+WEBKIT_DISABLE_COMPOSITING_MODE=1 target/release/syscall-workbench --db=...
+```
+
+See [WSL2 compatibility](/operations/wsl).
+
+### Export button cannot choose a path
+
+That is intentional. The backend fixes the export directory to `~/.local/share/syscall/exports` or `SYSCALL_EXPORT_DIR` at startup.
+
+## Documentation preview
+
+From `docs/`:
+
+```bash
+npx mint dev --no-open
+npx mint validate
+npx mint broken-links
+```
+
+If a page is missing, confirm the file path is listed in `docs.json` and the file has valid frontmatter.
+
+## Before asking for help
+
+Collect:
+
+- `syscall info --json`
+- The exact command and exit code
+- The session status and counters
+- Relevant `RUST_LOG` output
+- Whether the host is WSL2, native Linux, or a container
+- The database schema version
+
+Do not include secrets, raw credential paths, or unrelated evidence in a public issue.
