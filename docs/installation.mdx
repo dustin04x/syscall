@@ -58,6 +58,28 @@ cargo build --workspace
 
 The CLI binary is `target/release/syscall`. The desktop release binary is `target/release/syscall-workbench` after a Tauri release build.
 
+## Docker (UI preview and CLI container)
+
+If you have Docker Desktop or Docker Compose, you can launch the standalone web UI preview and a `syscall` CLI container with one command:
+
+```bash
+docker compose up --build -d
+```
+
+- **UI preview:** [http://localhost:8080](http://localhost:8080) serves the standalone mock workbench from `ui/` (in-memory preview data).
+- **CLI container:** run `docker compose exec syscall syscall --help`. The repository is mounted at `/work`, so you can inspect, analyze, verify, and export mounted SQLite session databases.
+
+```bash
+docker compose exec syscall syscall sessions list --db /work/sessions.db
+docker compose exec syscall syscall verify <SESSION_ID> --db /work/sessions.db
+```
+
+<Warning>
+Live eBPF `record` requires Linux kernel BPF/BTF/tracefs support and elevated privileges on the host kernel. Running `record` inside Docker Desktop's Linux VM is environment-dependent and may not work the same as a native Linux host. Use a supported host for capture, then inspect the resulting database with the CLI container or a local build.
+</Warning>
+
+Stop the containers with `docker compose down`.
+
 ## Check the eBPF object
 
 ```bash

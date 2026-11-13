@@ -29,6 +29,16 @@ cd ..
 
 The binary is `target/release/syscall-workbench`.
 
+### Web UI preview (Docker)
+
+To preview the standalone workbench UI without the desktop toolchain, run:
+
+```bash
+docker compose up --build -d
+```
+
+Open [http://localhost:8080](http://localhost:8080). This serves the mock/preview UI from `ui/` (not the Tauri evidence-backed backend). For CLI access to mounted databases in the same stack, use `docker compose exec syscall syscall --help`. See [Installation](/installation#docker-ui-preview-and-cli-container) for details and limitations.
+
 ## Open a database
 
 The database path is fixed when the application starts:

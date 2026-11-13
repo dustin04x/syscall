@@ -121,6 +121,10 @@ target/release/syscall-workbench --db="$HOME/.local/share/syscall/syscall.db"
 
 The workbench has no recording control. Record with the CLI, then open the result. See [Workbench](/guides/workbench) for the screen guide and the Tauri security boundary.
 
+<Tip>
+To launch a quick web UI preview without building the desktop app, run `docker compose up --build -d` and open [http://localhost:8080](http://localhost:8080). This serves the standalone mock workbench; for evidence-backed investigation of real session databases, use the native desktop workbench or the CLI. See [Installation](/installation#docker-ui-preview-and-cli-container).
+</Tip>
+
 ## Next steps
 
 <CardGroup cols={2}>
