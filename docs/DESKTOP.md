@@ -4,9 +4,11 @@
 
 The desktop application is a Tauri 2 + React + TypeScript investigation surface over the
 existing SYSCALL evidence store. It does not create synthetic sessions, charts, findings, or
-verification results. Every number shown in the screenshots below comes from the persisted
+verification results. The release binary was validated against the persisted
 `e2e-normal-1794338281489487713` session (43 events, 3 processes, kernel
-`6.6.87.2-microsoft-standard-WSL2`, recorded 2026-11-10).
+`6.6.87.2-microsoft-standard-WSL2`, recorded 2026-11-10). The current interface screenshots
+in section 3 were captured later from the standalone renderer's deterministic preview dataset;
+they document the redesigned interface, not the live e2e recording.
 
 | Area | Result |
 |---|---|
@@ -16,7 +18,7 @@ verification results. Every number shown in the screenshots below comes from the
 | Tauri GUI compile/check | **PASS** — `cargo check -p syscall-desktop --all-targets` with Ubuntu 24.04 headers |
 | Release build | **PASS** — `target/release/syscall-workbench` (`tauri build --no-bundle`) |
 | WSLg launch | **PASS** — real window at 1480×920, software rendering |
-| Screens captured | **PASS** — 11 captures: Overview, Sessions, Summary, Processes, Timeline, Filesystem, Network, Behavioral analysis, Verification, Export, Export result |
+| Interface captures | **PASS** — 11 current-design captures from the standalone renderer: Overview, Sessions, Summary, Processes, Timeline, Filesystem, Network, Behavioral analysis, Verification, Export, Export result |
 | Export through the GUI | **PASS** — 64,138-byte JSON package, mode `0600`, SHA-256 manifest rendered |
 | Privileged recording from the GUI | **Not implemented by design** — read-only workbench |
 
@@ -122,8 +124,10 @@ The frontend uses hash routes so the window can preserve a session and tab:
 
 ## 3. Screens
 
-All screenshots below were captured from the release binary against the real session above,
-not from a browser mock-up or fixture server.
+All screenshots below were captured from the standalone renderer using its deterministic
+preview dataset. They show the same React interface as the desktop build (the shell labels
+the contract as `ui-preview`); they document the interface, not evidence from a live session.
+The live validation of the release binary is described above.
 
 ### Overview
 
@@ -404,8 +408,9 @@ structured errors. They do not use a mocked database.
   content or untrusted plugins.
 - **Export destination is fixed** to the backend-managed directory; there is no save dialog.
 - **No signed/notarized package** and no installer was produced (`--no-bundle` release binary).
-- **No automated GUI end-to-end test.** The ten screenshots and the export were exercised
-  manually against a real database; backend and component behavior are covered by tests.
+- **No automated GUI end-to-end test.** The release build and export were exercised manually
+  against a real database. The current interface screenshots use the standalone renderer's
+  preview dataset; backend and component behavior are covered by tests.
 - **WSLg software rendering** was used. GPU acceleration and accessibility-bus integration
   were unavailable.
 - **Large sessions:** analysis and export are bounded by the existing engines; the UI pages
